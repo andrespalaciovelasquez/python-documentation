@@ -659,6 +659,46 @@ def generadores():
     for i in range(3):
         print(f"Valor del generador: {next(generador)}")
 
+    print("\n## Expresión Generadora y next()")
+    
+    """
+    La Expresión Generadora es una forma concisa (implica 'yield' automáticamente) 
+    de crear un generador sin definir una función con 'def'.
+    Se usa principalmente para filtros y búsquedas sencillas en línea.
+    
+    La función 'next(generador, valor_por_defecto)' es el método para consumir
+    explícitamente un generador y obtener el siguiente valor. Es ideal para buscar
+    el primer elemento coincidente en una lista.
+    """
+    
+    data = [
+        {"id": 101, "name": "A"}, 
+        {"id": 102, "name": "B"}, 
+        {"id": 103, "name": "C"}
+    ]
+    target_id = 102
+    
+    # 1. Creación de la Expresión Generadora (el 'yield' es implícito)
+    # Crea un generador que solo producirá el cliente con el ID 102 (o nada).
+    generator_expression = (client for client in data if client.get("id") == target_id)
+    
+    print(f"Buscando ID: {target_id}")
+    # 2. Uso de next() para consumir el primer (y único) valor del generador.
+    # El segundo argumento (None) es el valor por defecto si no se encuentra nada.
+    found_item = next(generator_expression, None)
+    
+    print(f"Resultado de next(): {found_item}")
+    
+    # Ejemplo de no encontrado
+    target_id_fail = 999
+    generator_fail = (client for client in data if client.get("id") == target_id_fail)
+    not_found_item = next(generator_fail, "NO ENCONTRADO")
+    
+    print(f"\nBuscando ID: {target_id_fail}")
+    print(f"Resultado de next() (con valor por defecto): {not_found_item}")
+    
+    print("\n El uso de next() con una Expresión Generadora detiene la iteración en el primer match, siendo muy eficiente para búsquedas.")
+
 # =================================================================================================================
 #                    ▀▄▀▄▀▄⡷⠂ 13. MANEJO DE EXCEPCIONES ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================

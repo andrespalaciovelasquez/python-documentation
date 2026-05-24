@@ -8,34 +8,88 @@ Cada sección incluye un **ejemplo de código claro y comentado** que ilustra el
 
 ## 📋 Tabla de Contenido
 
-* **1.** [Variables](#variables)
-* **2.** [Listas](#listas)
-* **3.** [Tuplas](#tuplas)
-* **4.** [Diccionarios](#diccionarios)
-* **5.** [Operadores](#operadores)
-* **6.** [Condicionales](#condicionales)
-* **7.** [Bucles](#bucles)
-* **8.** [Funciones](#funciones)
-* **9.** [Clases](#clases)
-* **10.** [Módulos](#módulos)
-* **11.** [Funciones Lambda](#funciones-lambda)
-* **12.** [Generadores](#generadores)
-* **13.** [Manejo de Excepciones](#manejo-de-excepciones)
-* **14.** [Manejo de Archivos](#manejo-de-archivos)
-* **15.** [Expresiones Regulares](#expresiones-regulares)
-* **16.** [Decoradores](#decoradores)
-* **17.** [Context Managers](#context-managers)
-* **18.** [Métodos Mágicos](#métodos-mágicos)
+### Bloque 1: Datos y Tipos
+| # | Tema | Descripción |
+|---|------|-------------|
+| 1 | **Variables** | Tipado dinámico, asignación múltiple, intercambio, constantes |
+| 2 | **Strings** | Métodos de cadena, f-strings avanzadas, raw strings |
+| 3 | **Listas** | Colecciones mutables, slicing, métodos principales |
+| 4 | **Tuplas** | Colecciones inmutables, empaquetado/desempaquetado |
+| 5 | **Sets** | Conjuntos, operaciones matemáticas, frozenset |
+| 6 | **Diccionarios** | Pares clave-valor, métodos, merge operator |
+| 7 | **Comprehensions** | List, dict, set comprehensions, expresiones generadoras |
+
+### Bloque 2: Control de Flujo
+| # | Tema | Descripción |
+|---|------|-------------|
+| 8 | **Operadores** | Aritméticos, comparación, lógicos, identidad, walrus |
+| 9 | **Condicionales** | if/elif/else, ternario, match-case (3.10+) |
+| 10 | **Bucles** | for, while, enumerate, zip, break/continue, else |
+
+### Bloque 3: Funciones
+| # | Tema | Descripción |
+|---|------|-------------|
+| 11 | **Funciones** | *args/**kwargs, keyword-only, positional-only, recursión |
+| 12 | **Funciones Lambda** | Funciones anónimas, uso con filter/map/sorted |
+| 13 | **Closures** | Cierres, nonlocal, fábricas de funciones |
+| 14 | **Decoradores** | @wraps, decoradores con parámetros, apilamiento |
+| 15 | **Generadores** | yield, yield from, pipelines, expresiones generadoras |
+
+### Bloque 4: Programación Orientada a Objetos
+| # | Tema | Descripción |
+|---|------|-------------|
+| 16 | **Clases** | OOP básica, herencia, @classmethod, @staticmethod |
+| 17 | **OOP Avanzado** | Encapsulamiento, @property, herencia múltiple, MRO, ABC, __slots__ |
+| 18 | **Métodos Mágicos** | Dunder methods: __add__, __eq__, __hash__, __getitem__, __call__ |
+| 19 | **Dataclasses** | @dataclass, frozen, field(), order, __post_init__ |
+
+### Bloque 5: Robustez y Gestión de Recursos
+| # | Tema | Descripción |
+|---|------|-------------|
+| 20 | **Excepciones** | try/except/else/finally, manejo de errores |
+| 21 | **Excepciones Personalizadas** | Jerarquía de errores de dominio |
+| 22 | **Context Managers** | with, __enter__/__exit__, @contextmanager |
+| 23 | **Manejo de Archivos** | Lectura, escritura, modos, encoding |
+
+### Bloque 6: Biblioteca Estándar y Herramientas
+| # | Tema | Descripción |
+|---|------|-------------|
+| 24 | **Módulos** | import, alias, módulos propios, estándar |
+| 25 | **Expresiones Regulares** | re.search, findall, sub, grupos de captura |
+| 26 | **Collections e Itertools** | Counter, defaultdict, namedtuple, deque, chain, groupby |
+| 27 | **Type Hints** | Tipado estático, Optional, Union, clases propias |
+
+### Bonus
+| # | Tema | Descripción |
+|---|------|-------------|
+| 28 | **Próximos Pasos** | Mapa del ecosistema: frameworks y librerías por dominio |
 
 ---
 
 ## 🚀 Cómo Usar
 
-* **1.** Asegúrate de tener **Python 3.x** instalado en tu sistema.
-* **2.** Clona o descarga este repositorio.
-* **3.** Abre una terminal y navega hasta la carpeta del proyecto.
-* **4.** Ejecuta el archivo principal con el siguiente comando: python python_documentation.py
-* **5.** Observa cómo cada sección del código se ejecuta y muestra sus ejemplos en la terminal.
+### Ejecutar toda la documentación
+```bash
+python python_documentation.py
+```
+
+### Ejecutar una sección específica
+```bash
+python python_documentation.py <seccion>
+```
+
+### Ver las secciones disponibles
+```bash
+python python_documentation.py help
+```
+
+### Ejemplos
+```bash
+python python_documentation.py decoradores
+python python_documentation.py closures
+python python_documentation.py type_hints
+python python_documentation.py collections
+```
 
 ---
 

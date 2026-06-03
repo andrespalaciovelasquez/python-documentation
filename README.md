@@ -1,12 +1,14 @@
-# 📚 Documentación de Conceptos de Python
+# 📚 Documentación de Conceptos de Python y Flask
 
 Autor: **Andrés Palacio Velásquez**
 
-Este proyecto es una documentación completa y autodidacta de los conceptos fundamentales e intermedios del lenguaje de programación Python. Ha sido diseñada para ser una guía práctica y ejecutable, ideal para principiantes que buscan entender los pilares de Python y para desarrolladores que desean un repaso rápido.
+Este proyecto es una biblioteca completa y autodidacta de documentación de conceptos fundamentales del lenguaje de programación **Python** y patrones avanzados de desarrollo y arquitectura con el framework **Flask**. Ha sido diseñado como una guía didáctica de referencia de alto nivel, ideal tanto para repasar pilares clave como para diseñar arquitecturas listas para producción.
 
-Cada sección incluye un **ejemplo de código claro y comentado** que ilustra el concepto en cuestión, permitiendo a los usuarios ejecutar el archivo y ver los resultados directamente en su terminal.
+Cada sección incluye **explicaciones detalladas, análisis conceptuales y ejemplos prácticos de código comentados paso a paso**.
 
-## 📋 Tabla de Contenido
+---
+
+## 📋 Tabla de Contenido: Módulo Python
 
 ### Bloque 1: Datos y Tipos
 | # | Tema | Descripción |
@@ -59,37 +61,70 @@ Cada sección incluye un **ejemplo de código claro y comentado** que ilustra el
 | 26 | **Collections e Itertools** | Counter, defaultdict, namedtuple, deque, chain, groupby |
 | 27 | **Type Hints** | Tipado estático, Optional, Union, clases propias |
 
+### Bloque 7: Arquitectura y Rendimiento
+| # | Tema | Descripción |
+|---|------|-------------|
+| 28 | **Entornos Virtuales** | venv, aislamiento de dependencias, pip freeze |
+| 29 | **Concurrencia y Async** | GIL, threading vs multiprocessing, asyncio |
+| 30 | **Fugas de Memoria** | Reference counting, Garbage Collector, weakref, optimizaciones |
+
 ### Bonus
 | # | Tema | Descripción |
 |---|------|-------------|
-| 28 | **Próximos Pasos** | Mapa del ecosistema: frameworks y librerías por dominio |
+| 31 | **Próximos Pasos** | Mapa del ecosistema: frameworks y librerías por dominio |
+
+---
+
+## 📋 Tabla de Contenido: Módulo Flask — Construyendo una App Real
+
+> El documento enseña Flask construyendo una aplicación real paso a paso. Cada bloque genera un archivo concreto del proyecto que será utilizado por los bloques siguientes.
+
+| Bloque | Archivo Generado | Descripción |
+|--------|------------------|-------------|
+| 1 | — | **Introducción a Flask & WSGI** — Qué es Flask, ciclo de vida de peticiones, Hola Mundo canónico |
+| 2 | — | **Arquitectura del Proyecto** — Estructura de directorios, responsabilidad de cada archivo, flujo HTTP |
+| 3 | `config.py` | **Configuración por Entornos** — Clases de config (Dev/Prod), variables de entorno, conexión SQL Server |
+| 4 | `models.py` | **Modelos ORM** — Tablas con `db.Model`, columnas, relaciones 1-a-muchos, cascade |
+| 5 | `services.py` | **Servicios — Lógica de Negocio** — CRUD completo, transacciones seguras con rollback |
+| 6 | `schemas.py` | **Esquemas de Validación (Pydantic V2)** — Esquemas In/Out, `from_attributes`, `model_validate()` |
+| 7 | `exceptions.py` + `handlers.py` | **Errores Centralizados** — Jerarquía de excepciones, interceptores automáticos |
+| 8 | `routes.py` | **Rutas y Controladores** — Blueprint, CRUD completo, request/response, cookies, sessions |
+| 9 | `__init__.py` + `run.py` | **Factory Pattern** — `create_app()`, registro de Blueprints, punto de entrada |
+| 10 | `logging_config.py` | **Logging y Observabilidad** — Formatters, RotatingFileHandler, niveles de log |
+| 11 | `conftest.py` + `tests/` | **Testing con Pytest** — Fixtures, scopes, test_client, aislamiento transaccional |
+| 12 | `security.py` | **Hashing y Seguridad** — Protección de contraseñas con PBKDF2:SHA256 y Salting |
+| 13 | `auth/routes.py` | **JWT y Autenticación** — Access Tokens, Refresh Tokens y Blocklist stateless |
+| 14 | `auth/decorators.py` | **Roles y Permisos** — Decoradores custom (`@roles_required`) inspeccionando JWT |
+| 15 | `middleware.py` | **Middleware y Hooks** — `@app.before_request`, headers de seguridad y WSGI puro |
+| 16 | `__init__.py` | **Rate Limiting** — Prevención de Fuerza Bruta / DDoS con `Flask-Limiter` y Redis |
+| 17 | `tasks.py` | **Tareas en Segundo Plano** — Configuración de `Celery`, Workers y encolamiento |
+| 18 | `Dockerfile` + `compose` | **Docker y Contenedorización** — Multi-stage, Drivers SQL Server, docker-compose |
 
 ---
 
 ## 🚀 Cómo Usar
 
-### Ejecutar toda la documentación
+### 🐍 Módulo Python (Práctico y Ejecutable)
+Para ejecutar ejemplos prácticos del manual de Python:
+
 ```bash
+# Ejecutar toda la documentación de Python
 python python_documentation.py
-```
 
-### Ejecutar una sección específica
-```bash
-python python_documentation.py <seccion>
-```
-
-### Ver las secciones disponibles
-```bash
+# Ver las secciones de Python disponibles
 python python_documentation.py help
+
+# Ejecutar una sección de Python específica
+python python_documentation.py decoradores
+python python_documentation.py type_hints
 ```
 
-### Ejemplos
-```bash
-python python_documentation.py decoradores
-python python_documentation.py closures
-python python_documentation.py type_hints
-python python_documentation.py collections
-```
+### 🌶️ Módulo Flask (Lectura Pasiva en IDE)
+El manual de Flask ha sido diseñado como un documento de estudio directamente en el IDE. A diferencia del módulo de Python, este archivo **no se ejecuta por consola**, sino que guía al lector a través de la construcción progresiva de una aplicación real:
+
+- Ábrelo directamente en tu editor de código (VSCode, PyCharm, etc.).
+- Todo el código se presenta sin comentar para aprovechar el resaltado de sintaxis nativo.
+- Cada bloque genera un archivo real del proyecto y referencia los archivos construidos previamente.
 
 ---
 

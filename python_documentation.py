@@ -18,6 +18,9 @@ from functools import wraps
 from itertools import chain, islice, groupby
 from typing import Optional
 
+# Configurar stdout para soportar UTF-8 en Windows (emojis y caracteres especiales)
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
 
 def generate_toc():
     """Genera una tabla de contenido basada en los nombres de las funciones."""
@@ -63,8 +66,13 @@ def generate_toc():
         "    26. Collections e Itertools",
         "    27. Type Hints (Tipado Estático)",
         "",
+        "  BLOQUE 7: ARQUITECTURA Y RENDIMIENTO",
+        "    28. Entornos Virtuales (venv)",
+        "    29. Concurrencia y Async (GIL, Threads, Asyncio)",
+        "    30. Rendimiento y Fugas de Memoria",
+        "",
         "  BONUS",
-        "    28. Próximos Pasos (Frameworks y Librerías)",
+        "    31. Próximos Pasos (Frameworks y Librerías)",
     ]
     for item in toc_items:
         print(item)
@@ -1278,31 +1286,37 @@ def clases():
         def saludar(self):
             print(f"Hola, mi nombre es {self.nombre} y tengo {self.edad} años.")
         
-        # Método de clase: @classmethod
-        # Opera sobre la clase misma, no sobre una instancia específica.
-        # Usa 'cls' como primer parámetro, que se refiere a la clase.
+        # ─── MÉTODOS DE CLASE VS ESTÁTICOS ───
+        # Pregunta frecuente de entrevista: ¿Cuál es la diferencia?
+        
+        # 1. Método de clase: @classmethod
+        # - Recibe 'cls' (la clase) como primer argumento implícito, NO 'self'.
+        # - Puede modificar el estado de la clase (ej: cls.especie = "Mutante").
+        # - Caso de uso principal: Constructores alternativos (Factory Methods).
         @classmethod
-        def get_especie(cls):
-            return f"Esta es una clase de la especie: {cls.especie}"
+        def desde_anio_nacimiento(cls, nombre, anio_nacimiento):
+            """Constructor alternativo usando @classmethod."""
+            import datetime
+            edad_calculada = datetime.date.today().year - anio_nacimiento
+            return cls(nombre, edad_calculada)  # Llama al __init__ usando 'cls'
 
-        # Método estático: @staticmethod
-        # No recibe ni 'self' ni 'cls'. Es una función que pertenece
-        # lógicamente a la clase pero no necesita acceder a la instancia ni a la clase.
+        # 2. Método estático: @staticmethod
+        # - No recibe ni 'self' ni 'cls'. Es solo una función normal anidada en la clase.
+        # - No puede modificar ni el estado del objeto ni de la clase.
+        # - Caso de uso principal: Funciones utilitarias (Helpers) relacionadas conceptualmente.
         @staticmethod
         def es_mayor_de_edad(edad):
             return edad >= 18
 
     # Creación de objetos (instancias de la clase)
     persona1 = Persona("Palacio", 26)
-    persona2 = Persona("Tatiana", 24)
+    persona2 = Persona.desde_anio_nacimiento("Tatiana", 2002) # Usando el classmethod
 
     # Acceder a atributos y llamar a métodos
-    print("## Creando y usando instancias")
+    print("## Instancias, @classmethod y @staticmethod")
     persona1.saludar()
-    print(f"El atributo de clase 'especie' es: {persona2.especie}")
-    print(Persona.get_especie())
-    print(f"¿Es mayor de edad (26)? {Persona.es_mayor_de_edad(26)}")
-    print(f"¿Es mayor de edad (15)? {Persona.es_mayor_de_edad(15)}")
+    persona2.saludar()
+    print(f"¿Es mayor de edad (26)? {Persona.es_mayor_de_edad(26)}") # Usando el staticmethod
 
     # Herencia
     # La clase 'Estudiante' hereda de 'Persona', lo que significa que
@@ -2348,11 +2362,330 @@ def type_hints():
 
 
 # =================================================================================================================
+#        ▀▄▀▄▀▄⡷⠂ BLOQUE 7: ARQUITECTURA Y RENDIMIENTO ⠐⢾▀▄▀▄▀▄
+# =================================================================================================================
+
+# =================================================================================================================
+#                         ▀▄▀▄▀▄⡷⠂ 28. ENTORNOS VIRTUALES ⠐⢾▀▄▀▄▀▄
+# =================================================================================================================
+def entornos_virtuales():
+    """
+    Los entornos virtuales resuelven el problema de "En mi máquina sí funciona".
+    Permiten crear instalaciones de Python aisladas, donde cada proyecto tiene 
+    sus propias dependencias sin afectar al Python global del sistema.
+    """
+    print("\n--- 28. Entornos Virtuales (venv) ---")
+    print("\n Revisa los comentarios de esta sección en el documento .py para entender los entornos virtuales en Python.\n")
+
+    # ============================================================
+    # ¿POR QUÉ SON INDISPENSABLES?
+    # ============================================================
+
+    # Si el Proyecto A usa Django 3.0 y el Proyecto B usa Django 4.0,
+    # instalarlos globalmente causará conflictos de versiones.
+    #
+    # Un entorno virtual encapsula:
+    # - Dependencias
+    # - Librerías
+    # - Paquetes
+    #
+    # para CADA proyecto de manera independiente.
+    #
+    # IMPORTANTE:
+    # Un venv NO crea un Python nuevo desde cero.
+    # Usa el intérprete base del sistema, pero con paquetes aislados.
+
+    # ============================================================
+    # COMANDOS BÁSICOS (TERMINAL)
+    # ============================================================
+
+    # 1. Crear el entorno:       python -m venv venv
+    # 2. Activar (Windows):      venv\Scripts\activate
+    # 3. Activar (Mac/Linux):    source venv/bin/activate
+    # 4. Instalar paquetes:      pip install requests
+    # 5. Guardar dependencias:   pip freeze > requirements.txt
+    # 6. Instalar dependencias:  pip install -r requirements.txt
+    # 7. Desactivar:             deactivate
+
+    # ============================================================
+    # BUENAS PRÁCTICAS
+    # ============================================================
+
+    # - Nunca subas la carpeta 'venv' a GitHub (añádela a .gitignore).
+    # - Sube solo el archivo 'requirements.txt'.
+
+
+# =================================================================================================================
+#                  ▀▄▀▄▀▄⡷⠂ 29. CONCURRENCIA Y ASYNC ⠐⢾▀▄▀▄▀▄
+# =================================================================================================================
+def concurrencia_y_async():
+    """
+    Python tiene múltiples modelos para hacer varias cosas a la vez. 
+    Elegir el correcto depende de si el problema requiere mucha CPU (cálculos) 
+    o mucho tiempo de espera (I/O, red, discos).
+    """
+    print("\n--- 29. Concurrencia y Async (GIL, Threads, Asyncio) ---")
+    print("\n Revisa los comentarios de esta sección en el documento .py para entender concurrencia, paralelismo, GIL, threading, multiprocessing y asyncio en Python.\n")
+
+    # Python tiene varios modelos para ejecutar tareas concurrentes.
+    # La elección depende principalmente de si el problema es:
+    #
+    # - CPU Bound:
+    #   Mucho cálculo matemático o procesamiento intensivo.
+    #
+    # - I/O Bound:
+    #   Mucho tiempo esperando red, APIs, archivos o bases de datos.
+
+
+    # ============================================================
+    # CONCURRENCIA VS PARALELISMO
+    # ============================================================
+
+    # Concurrencia:
+    # Varias tareas progresan al mismo tiempo.
+    #
+    # Paralelismo:
+    # Varias tareas ejecutándose literalmente al mismo tiempo
+    # usando múltiples núcleos del CPU.
+
+
+    # ============================================================
+    # EL GIL (GLOBAL INTERPRETER LOCK)
+    # ============================================================
+
+    # CPython tiene un lock interno llamado GIL.
+    #
+    # Este lock permite que solo un thread ejecute bytecode Python
+    # a la vez dentro de un proceso.
+    #
+    # Por eso, los threads normalmente NO mejoran tareas
+    # CPU-bound puras escritas en Python.
+    #
+    # Sin embargo:
+    # - El GIL cambia constantemente entre threads.
+    # - Operaciones I/O suelen liberar el GIL.
+    # - Librerías escritas en C (NumPy, OpenCV, TensorFlow, etc.)
+    #   pueden liberar el GIL y aprovechar múltiples núcleos.
+
+
+    # ============================================================
+    # 1. THREADING (HILOS)
+    # ============================================================
+
+    # Cuándo usar:
+    # - Tareas I/O bound.
+    # - APIs.
+    # - Archivos.
+    # - Sockets.
+    # - Bases de datos.
+    #
+    # ¿Por qué funciona bien para I/O?
+    # Mientras un hilo espera una respuesta de red o disco,
+    # el GIL puede liberarse y otro hilo continuar trabajando.
+    #
+    # Ventajas:
+    # - Fácil de implementar.
+    # - Muy útil para tareas bloqueantes.
+    #
+    # Desventajas:
+    # - No ofrece paralelismo real para CPU-bound en CPython.
+    #
+    # Módulos comunes:
+    # - threading
+    # - concurrent.futures.ThreadPoolExecutor
+
+
+    # ============================================================
+    # 2. MULTIPROCESSING (PROCESOS)
+    # ============================================================
+
+    # Cuándo usar:
+    # - Tareas CPU bound.
+    # - Machine Learning.
+    # - Procesamiento de imágenes.
+    # - Compresión.
+    # - Cálculos matemáticos intensivos.
+    #
+    # ¿Por qué funciona?
+    # Cada proceso tiene:
+    # - Su propio intérprete.
+    # - Su propia memoria.
+    # - Su propio GIL.
+    #
+    # Esto permite paralelismo real.
+    #
+    # Desventajas:
+    # - Más consumo de memoria.
+    # - Comunicación entre procesos más costosa.
+    #
+    # Módulos comunes:
+    # - multiprocessing
+    # - concurrent.futures.ProcessPoolExecutor
+
+
+    # ============================================================
+    # 3. ASYNCIO (ASINCRONISMO COOPERATIVO)
+    # ============================================================
+
+    # Cuándo usar:
+    # - Miles de conexiones concurrentes.
+    # - APIs masivas.
+    # - WebSockets.
+    # - Servidores modernos.
+    #
+    # ¿Cómo funciona?
+    # Usa un Event Loop en un solo hilo.
+    #
+    # Las tareas cooperan entre sí usando:
+    # - async
+    # - await
+    #
+    # Cuando una tarea hace:
+    #     await algo()
+    #
+    # cede el control para que otra tarea pueda ejecutarse.
+    #
+    # Esto se llama concurrencia cooperativa.
+    #
+    # Ventajas:
+    # - Muy eficiente en consumo de recursos.
+    # - Excelente escalabilidad para I/O.
+    # - Mucho más ligero que crear miles de threads.
+    #
+    # Desventajas:
+    # - No acelera tareas CPU-bound.
+    # - Requiere librerías compatibles con async.
+    # - Puede ser más complejo de depurar.
+    #
+    # Ejemplo conceptual:
+    #
+    # async def obtener_datos():
+    #     resultado = await peticion_http()
+    #     return resultado
+
+
+    # ============================================================
+    # RESUMEN RÁPIDO
+    # ============================================================
+
+    # THREADING:
+    # ✔ Bueno para I/O
+    # ✘ Malo para CPU-bound puro
+    #
+    # MULTIPROCESSING:
+    # ✔ Bueno para CPU-bound
+    # ✔ Paralelismo real
+    # ✘ Más pesado
+    #
+    # ASYNCIO:
+    # ✔ Excelente para MUCHAS tareas I/O concurrentes
+    # ✔ Muy eficiente
+    # ✘ No sirve para paralelizar CPU
+
+# =================================================================================================================
+#                  ▀▄▀▄▀▄⡷⠂ 30. RENDIMIENTO Y FUGAS DE MEMORIA ⠐⢾▀▄▀▄▀▄
+# =================================================================================================================
+def fugas_de_memoria():
+    """
+    Aunque Python tiene Garbage Collector y manejo automático de memoria,
+    las aplicaciones grandes o de larga duración pueden aumentar su consumo
+    de memoria inesperadamente si los objetos permanecen referenciados.
+    """
+
+    print("\n--- 30. Rendimiento y Fugas de Memoria ---")
+    print("\n📘 Revisa los comentarios de esta sección en el documento .py para entender el manejo de memoria en Python.\n")
+
+
+    # ============================================================
+    # ¿CÓMO FUNCIONA LA MEMORIA EN PYTHON?
+    # ============================================================
+
+    # Python usa principalmente:
+    #
+    # 1. Reference Counting
+    #    Cada objeto lleva un contador de referencias.
+    #
+    # 2. Garbage Collector (GC)
+    #    Detecta ciclos de referencia que el conteo normal no puede liberar.
+
+
+    # ============================================================
+    # ¿POR QUÉ PUEDE CRECER LA MEMORIA?
+    # ============================================================
+
+    # Muchas veces no son "memory leaks" reales,
+    # sino objetos que siguen vivos accidentalmente.
+    #
+    # Ejemplos comunes:
+    #
+    # 1. Listas o diccionarios globales que crecen infinitamente.
+    # 2. Cachés mal diseñadas.
+    # 3. Variables globales reteniendo objetos grandes.
+    # 4. Referencias persistentes en singletons.
+    # 5. Objetos con ciclos de referencia complejos.
+    # 6. Librerías externas o extensiones en C.
+
+
+    # ============================================================
+    # HERRAMIENTAS DE DEPURACIÓN
+    # ============================================================
+
+    # tracemalloc
+    # ------------------------------------------------------------
+    # Módulo estándar para rastrear dónde se asignó memoria.
+
+    # import tracemalloc
+    # tracemalloc.start()
+
+    # snapshot = tracemalloc.take_snapshot()
+    # top_stats = snapshot.statistics('lineno')
+
+
+    # objgraph
+    # ------------------------------------------------------------
+    # Librería externa excelente para visualizar referencias
+    # entre objetos y detectar quién mantiene viva la memoria.
+
+
+    # memory_profiler
+    # ------------------------------------------------------------
+    # Permite medir consumo de memoria línea por línea.
+
+
+    # ============================================================
+    # WEAKREF Y CACHÉS
+    # ============================================================
+
+    # El módulo 'weakref' permite crear referencias débiles.
+    #
+    # Esto significa que el objeto puede ser destruido por
+    # el Garbage Collector si no existen otras referencias fuertes.
+    #
+    # Muy útil para:
+    # - cachés
+    # - observers
+    # - listeners
+    # - estructuras temporales
+
+
+    # ============================================================
+    # BUENAS PRÁCTICAS
+    # ============================================================
+
+    # - Evita estructuras globales gigantes.
+    # - Libera recursos grandes cuando ya no se necesiten.
+    # - Usa generadores en lugar de cargar todo en memoria.
+    # - Monitorea memoria en producción.
+    # - Ten cuidado con cachés infinitas.
+    # - Usa perfiles de memoria regularmente en sistemas grandes.
+
+
+# =================================================================================================================
 # ▀▄▀▄▀▄⡷⠂ 𝐄𝐉𝐄𝐂𝐔𝐂𝐈𝐎́𝐍 𝐃𝐄 𝐋𝐀 𝐃𝐎𝐂𝐔𝐌𝐄𝐍𝐓𝐀𝐂𝐈𝐎́𝐍 ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 
 # =================================================================================================================
-#          ▀▄▀▄▀▄⡷⠂ 28. PRÓXIMOS PASOS (FRAMEWORKS Y LIBRERÍAS) ⠐⢾▀▄▀▄▀▄
+#          ▀▄▀▄▀▄⡷⠂ 31. PRÓXIMOS PASOS (FRAMEWORKS Y LIBRERÍAS) ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 def proximos_pasos():
     """
@@ -2361,7 +2694,7 @@ def proximos_pasos():
     solo sirve como mapa de ruta para saber por dónde continuar una vez dominados
     los fundamentos del lenguaje.
     """
-    print("\n--- 28. Próximos Pasos: Frameworks y Librerías ---")
+    print("\n--- 31. Próximos Pasos: Frameworks y Librerías ---")
     print("Una vez que domines los fundamentos de Python, el siguiente paso es")
     print("especializarte en un área. Aquí tienes un mapa del ecosistema:\n")
 
@@ -2488,6 +2821,9 @@ SECCIONES = {
     "regex": expresiones_regulares,
     "collections": collections_itertools,
     "type_hints": type_hints,
+    "entornos": entornos_virtuales,
+    "concurrencia": concurrencia_y_async,
+    "memoria": fugas_de_memoria,
     "proximos_pasos": proximos_pasos,
 }
 

@@ -211,69 +211,193 @@ mi_proyecto_flask/
 # de comportamiento (tipos de datos, índices, transacciones y dialectos SQL).
 
 import os
+# os pertenece a la biblioteca estándar de Python, por lo que no requiere instalación adicional.
+# Lo usamos para leer variables de entorno del sistema operativo en tiempo de ejecución.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER DE VALIDACIÓN
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def _require_env(key: str) -> str:
+    """
+    Lee una variable de entorno y garantiza que existe Y no está vacía.
+ 
+    Problema que resuelve:
+      os.environ["KEY"] implementa Fail-Fast para claves AUSENTES, pero si la
+      clave existe con valor vacío (DB_SERVER="") o solo espacios (DB_SERVER="  "),
+      no falla: la URI se construye mal y el error aparece en la primera consulta
+      real en producción — demasiado tarde.
+ 
+    Esta función cubre los tres casos problemáticos:
+      - Clave ausente       → EnvironmentError
+      - Clave vacía ""      → EnvironmentError
+      - Clave con espacios  → EnvironmentError  (.strip())
+ 
+    Solo se usa en ProductionConfig. En desarrollo, os.environ.get() con
+    valores por defecto es suficiente y más cómodo.
+    """
+    value = os.environ.get(key, "").strip()
+    if not value:
+        raise EnvironmentError(
+            f"[PRODUCCIÓN] Variable de entorno requerida ausente o vacía: '{key}'. "
+            f"El servidor no puede arrancar sin ella."
+        )
+    return value
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BASE
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ConfigBase:
     """Configuraciones compartidas en todos los entornos."""
+    # Esta es la configuración base que será común y compartida entre todas las configuraciones DEV y PROD (Patrón de Herencia de Clases).
+    
     SECRET_KEY = os.environ.get("SECRET_KEY", "clave_desarrollo_temporal")
+    # os.environ.get() lee variables del sistema operativo exclusivamente. No tiene capacidad
+    # de leer un archivo .env por sí solo. Si no encuentra la variable, usa el valor por defecto,
+    # permitiendo arrancar la app sin interrupciones en desarrollo.
+    #
+    # ¿Cómo se leen entonces las variables de un archivo .env?
+    # Herramientas como python-dotenv (load_dotenv()) las "elevan" al sistema operativo antes
+    # de que config.py se ejecute. Una vez en el sistema, os.environ.get() las encuentra con
+    # normalidad — el mecanismo de lectura no cambia, cambia quién pobló el sistema operativo.
+    # Esto se configura en el entry point (run.py o app/__init__.py), nunca aquí.
+    #
+    # Recomendación: .env solo en desarrollo. En producción, usar variables del propio sistema
+    # de alojamiento (variables del SO, AWS Secrets Manager, Azure Key Vault, etc.), nunca
+    # un archivo .env en el servidor.
+    #
+    # En producción esta línea es sobreescrita por _require_env() en ProductionConfig,
+    # que aplica Fail-Fast real (ver más abajo).
+    #
+    # Recomendación para generar una SECRET_KEY segura con el módulo nativo 'secrets':
+    # python -c "import secrets; print(secrets.token_hex(32))"
+    
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    # SQLALCHEMY_TRACK_MODIFICATIONS es una función antigua que se mantiene por RETROCOMPATIBILIDAD para no romper aplicaciones viejas. 
+    # Básicamente es un sistema de seguimiento de eventos para cambios en la DB que consume demasiada memoria RAM y CPU, ralentizando el servidor y perjudicando la escalabilidad. Por ello se prefiere optar por alertas propias del ORM o de la propia DB.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DESARROLLO
+# ─────────────────────────────────────────────────────────────────────────────
 
 class DevelopmentConfig(ConfigBase):
     """Entorno de desarrollo local."""
+    
     DEBUG = True
-    # Para consistencia con producción, usamos SQL Server local en desarrollo.
-    # Usamos autenticación integrada de Windows o SQL Server local.
+    # DEBUG = True activa el debugger interactivo y la recarga automática del servidor.
+    # Facilita ubicar errores (ofrece un mapa interactivo en el navegador), pero expone
+    # líneas de código sensibles. NUNCA usar en producción.
+    
+    # Construimos la URI dinámicamente desde variables de entorno para evitar
+    # credenciales o IPs hardcodeadas en el código fuente (principio 12-Factor App).
+    _dev_server = os.environ.get("DB_SERVER_DEV", "localhost")
+    _dev_db     = os.environ.get("DB_NAME_DEV", "MiBaseDatosDev")
+    _dev_driver = os.environ.get("DB_DRIVER", "ODBC+Driver+18+for+SQL+Server")
+ 
     SQLALCHEMY_DATABASE_URI = (
-        'mssql+pyodbc://localhost/MiBaseDatosDev?'
-        'driver=ODBC+Driver+17+for+SQL+Server;Trusted_Connection=yes'
+        f"mssql+pyodbc://@{_dev_server}/{_dev_db}?"
+        f"driver={_dev_driver};Trusted_Connection=yes;TrustServerCertificate=yes"
     )
+    # TrustServerCertificate=yes es necesario en DEV cuando el servidor local usa
+    # un certificado autofirmado. En producción se omite para forzar la validación TLS.
+    #
+    # Autenticación Integrada (Windows Auth): el '@' sin usuario indica que se usa
+    # la identidad del proceso actual. Ideal para entornos corporativos locales.
+    # Ver nota al pie sobre otros métodos de autenticación.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRODUCCIÓN
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ProductionConfig(ConfigBase):
     """Entorno de producción real."""
+    
     DEBUG = False
-    SECRET_KEY = os.environ["SECRET_KEY"]  # Obligatorio en producción, sin valor por defecto
+    # DEBUG = False evita exponer código sensible en el navegador y muestra
+    # un error HTTP 500 genérico al usuario final.
+
+    # ¿Por qué _require_env() y no simplemente os.environ["SECRET_KEY"]?
+    # os.environ[] con corchetes lanza KeyError si la clave no existe — eso es Fail-Fast,
+    # pero incompleto. Si la variable existe pero está vacía (SECRET_KEY="") o contiene
+    # solo espacios (SECRET_KEY="  "), os.environ[] NO falla: devuelve el valor vacío,
+    # la URI se construye mal y el error aparece en la primera consulta real en producción.
+    # _require_env() cubre los tres casos: ausente, vacía y solo espacios, garantizando
+    # que el servidor no arranca a menos que todas las variables tengan valores reales.
+    SECRET_KEY   = _require_env("SECRET_KEY")
+    _prod_server = _require_env("DB_SERVER")
+    _prod_db     = _require_env("DB_NAME")
+    _prod_driver = os.environ.get("DB_DRIVER", "ODBC+Driver+18+for+SQL+Server")
+    # DB_DRIVER tiene valor por defecto porque un driver incorrecto produce un error
+    # claro e inmediato de pyodbc al conectar, no un fallo silencioso.
+ 
     SQLALCHEMY_DATABASE_URI = (
-        'mssql+pyodbc://@192.168.1.100/MiBaseDatos?'
-        'driver=ODBC+Driver+17+for+SQL+Server;Trusted_Connection=yes'
+        f"mssql+pyodbc://@{_prod_server}/{_prod_db}?"
+        f"driver={_prod_driver};Trusted_Connection=yes"
     )
+    # Sin TrustServerCertificate: en producción el servidor debe tener un certificado
+    # TLS válido (emitido por una CA reconocida). El Driver 18 cifra la conexión
+    # por defecto (Encrypt=yes implícito), rechazando certificados autofirmados.
 
-# ─── Explicación de las claves ───
-# SECRET_KEY             → Flask la usa para firmar cookies de sesión. DEBE ser secreta.
-# SQLALCHEMY_DATABASE_URI → La URI de conexión que SQLAlchemy usa para conectarse a la BD.
-# SQLALCHEMY_TRACK_MODIFICATIONS → False para evitar overhead de memoria innecesario.
-# DEBUG                  → True activa el debugger interactivo y recarga automática.
+# ─────────────────────────────────────────────────────────────────────────────
+# SELECTOR DE CONFIGURACIÓN
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+config = {
+    "development": DevelopmentConfig,
+    "production":  ProductionConfig,
+    "default":     DevelopmentConfig,
+}
+# Este diccionario permite seleccionar la configuración activa desde el entry point:
+#
+#   from app.core.config import config
+#   app.config.from_object(config[os.environ.get("FLASK_CONFIG", "default")])
+#
+# NOTA: No existe TestingConfig en este archivo de forma intencional.
+# La configuración de tests se inyecta a nivel de fixture en conftest.py,
+# manteniendo cada suite autocontenida y desacoplada de la configuración global.
 
-# ─── 🔑 Métodos de Autenticación en SQL Server ───
+# ─────────────────────────────────────────────────────────────────────────────
+# REFERENCIA: Métodos de Autenticación en SQL Server
+# ─────────────────────────────────────────────────────────────────────────────
 
 # 1. Autenticación Integrada (Windows Auth / Trusted Connection)
-# Ideal para entornos corporativos ya que no requiere almacenar contraseñas en texto plano.
+# Ideal para entornos corporativos locales. No requiere almacenar contraseñas en texto plano.
+# NOTA: En arquitecturas de contenedores (Docker/Linux), requiere configuración
+# adicional de Kerberos. En esos casos se recomienda Autenticación Estándar.
 #
 # SQLALCHEMY_DATABASE_URI = (
-#     'mssql+pyodbc://@SERVIDOR/BASE_DATOS?'
-#     'driver=ODBC+Driver+17+for+SQL+Server;Trusted_Connection=yes'
+#     "mssql+pyodbc://@SERVIDOR/BASE_DATOS?"
+#     "driver=ODBC+Driver+18+for+SQL+Server;Trusted_Connection=yes"
 # )
 #
-# Desglose de la URI:
+# Desglose:
 #   mssql+pyodbc://        → Dialecto SQLAlchemy + driver pyodbc
-#   @SERVIDOR              → '@' sin usuario inicial indica autenticación integrada de Windows
+#   @SERVIDOR              → '@' sin usuario indica autenticación integrada del proceso actual
 #   /BASE_DATOS            → Nombre de la base de datos
-#   Trusted_Connection=yes → Activa el inicio de sesión único (SSO) de Windows
-
+#   Trusted_Connection=yes → Activa el inicio de sesión único (SSO) basado en la identidad del sistema
+ 
+ 
 # 2. Autenticación Estándar (Usuario y Contraseña)
-# Requerida si SQL Server está en Linux, Docker, en la nube (ej: Azure SQL) o en una red sin Active Directory.
+# Requerida si SQL Server está en Linux, Docker, en la nube (ej: Azure SQL)
+# o en redes sin Active Directory.
 #
 # SQLALCHEMY_DATABASE_URI = (
-#     'mssql+pyodbc://usuario:contraseña@servidor:1433/base_datos?'
-#     'driver=ODBC+Driver+17+for+SQL+Server'
+#     "mssql+pyodbc://usuario:contraseña@servidor:1433/base_datos?"
+#     "driver=ODBC+Driver+18+for+SQL+Server"
 # )
 #
-# Desglose de la URI:
-#   usuario:contraseña     → Credenciales explícitas creadas en la base de datos
-#   @servidor:1433         → Dirección IP o dominio del servidor de BD + puerto (por defecto 1433)
-#   /base_datos            → Nombre de la base de datos a conectar
-#   driver=ODBC+Driver+17  → Driver instalado en el sistema (debe coincidir con la versión instalada)
+# Desglose:
+#   usuario:contraseña     → Credenciales SQL creadas en la instancia
+#   @servidor:1433         → IP o dominio del servidor + puerto por defecto de SQL Server
+#   /base_datos            → Nombre de la base de datos
+#   driver=ODBC+Driver+18  → El driver instalado en el sistema operativo debe coincidir
+#                            exactamente con la versión declarada aquí
 
+# ─────────────────────────────────────────────────────────────────────────────
+# REFERENCIA: Otros motores de Base de Datos
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─── 🌐 ¿Cómo cambia según otros motores de Base de Datos? ───
 # SQLAlchemy es multi-dialecto. Si deseas migrar tu aplicación a otro motor de base de datos,
 # solo necesitas cambiar la URI de conexión e instalar el driver correspondiente:
 
@@ -284,7 +408,18 @@ class ProductionConfig(ConfigBase):
 # SQLALCHEMY_DATABASE_URI = 'mysql+pymysql://usuario:contraseña@localhost:3306/mi_base_datos'
 
 # C. SQLite (Excelente para pruebas de unidad ultrarrápidas y prototipos sin dependencias externas)
-# SQLALCHEMY_DATABASE_URI = 'sqlite:///archivo_local.db'
+# SQLALCHEMY_DATABASE_URI = "sqlite:///archivo_local.db"
+# SQLALCHEMY_DATABASE_URI = "sqlite:///:memory:"  # En memoria, sin persistencia en disco
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOSARIO DE CLAVES
+# ─────────────────────────────────────────────────────────────────────────────
+# SECRET_KEY                    → Firma cookies de sesión, protección CSRF y tokens de un solo uso
+#                                 (ej: enlaces temporales para recuperación de contraseña).
+# SQLALCHEMY_DATABASE_URI       → URI que SQLAlchemy usa para conectarse a la base de datos.
+# SQLALCHEMY_TRACK_MODIFICATIONS → False elimina overhead de memoria y CPU innecesario.
+# DEBUG                         → True: debugger interactivo y recarga automática (solo DEV).
+#                                 False: error HTTP 500 genérico al usuario (PROD).
 
 
 # =================================================================================================================

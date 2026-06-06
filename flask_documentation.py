@@ -431,65 +431,197 @@ config = {
 # ─────────────────────────────────────────────────────────────────────────────
 # SQLAlchemy es el ORM más potente del ecosistema Python. Mapea tablas
 # relacionales como clases de Python, permitiendo operar la BD sin SQL manual.
-# SQLAlchemy 2.0+ introduce un sistema moderno y robusto basado en tipado estático
-# (Type Hints) con PEP 484. Esto permite autocompletado perfecto en tu IDE,
-# validación estática con herramientas como Mypy y una sintaxis más limpia y declarativa.
-# Cada clase que hereda de db.Model representa una tabla en la base de datos.
+#
+# 💡 Revolución SQLAlchemy 2.0+ (Tipado Estático PEP 484):
+# El sistema moderno basado en Type Hints ('Mapped' y 'mapped_column') resuelve
+# el gran problema de las versiones 1.x: la falta de autocompletado en el IDE
+# y la imposibilidad de hacer análisis estático de errores con herramientas como Mypy.
+#
+# Al heredar de 'db.Model', cada clase representa una tabla física en la BD,
+# y cada atributo de clase tipado representa una columna con restricciones.
 
 from app import db
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy import String, ForeignKey
 
-# ─── Modelo: Departamento ───
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODELO: DEPARTAMENTO (Entidad Padre)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class DepartamentoModel(db.Model):
     __tablename__ = "departamentos"
+    # __tablename__ es obligatorio en SQLAlchemy 2.0 con el sistema declarativo.
+    # Convención estándar: snake_case en plural (empleados, departamentos).
+    # Si se omite, SQLAlchemy lanza un error al inicializar — no hay inferencia
+    # automática del nombre de tabla a partir del nombre de la clase.
 
-    # Mapped[int] le indica al IDE y al ORM que este campo es un entero no nulo
     id: Mapped[int] = mapped_column(primary_key=True)
-    
-    # Al declarar Mapped[str], SQLAlchemy asume automáticamente nullable=False.
-    # Si quisiéramos que sea opcional, usaríamos Mapped[str | None]
-    nombre: Mapped[str] = mapped_column(String(100), unique=True)
+    # Mapped[int] deduce automáticamente 'nullable=False' — ninguna clave primaria
+    # puede ser NULL. Con primary_key=True, SQLAlchemy además genera la columna
+    # con autoincremento usando el mecanismo nativo del motor activo:
+    #   - SQL Server  → IDENTITY(1,1)
+    #   - PostgreSQL  → SERIAL / IDENTITY
+    #   - SQLite      → AUTOINCREMENT implícito en INTEGER PRIMARY KEY
+    # SQLAlchemy abstrae la diferencia, pero el comportamiento real depende
+    # del dialecto configurado en SQLALCHEMY_DATABASE_URI.
 
-    # Relación moderna 1 a muchos: Un departamento tiene una lista de empleados
-    # Usamos Mapped[list["EmpleadoModel"]] para autocompletado nativo
+    nombre: Mapped[str] = mapped_column(String(100), unique=True)
+    # Al declarar 'Mapped[str]', SQLAlchemy deduce automáticamente 'nullable=False'.
+    # 'String(100)' define el límite físico en SQL, mapeando a VARCHAR(100).
+    # Para columnas que se indexarán o compararán frecuentemente, siempre preferir
+    # String(n) sobre Mapped[str] sin límite, que genera VARCHAR(max) en SQL Server
+    # con implicaciones de rendimiento en índices y comparaciones.
+
+    # 🔄 Relación 1-a-Muchos (Padre → Hijos)
     empleados: Mapped[list["EmpleadoModel"]] = relationship(
         back_populates="departamento",
         cascade="all, delete-orphan"
     )
+    # - Mapped[list[...]] le dice al IDE que esto retornará una colección iterable de objetos.
+    #
+    # - back_populates: Obliga a una declaración bidireccional explícita en ambos modelos,
+    #   garantizando tipado y autocompletado perfecto en ambos extremos de la relación.
+    #   Es el estándar moderno frente al antiguo 'backref', que declaraba la relación de
+    #   forma "mágica" e invisible en la otra clase, rompiendo el análisis estático.
+    #
+    # - cascade="all, delete-orphan": Regla de integridad de negocio. Si el departamento
+    #   (Padre) se elimina, todos sus empleados asociados (Hijos) se borran automáticamente
+    #   de la BD. Técnicamente agrupa las siguientes operaciones:
+    #     · save-update   → propaga INSERT/UPDATE del padre a los hijos en sesión.
+    #     · merge         → propaga db.session.merge() del padre a los hijos.
+    #     · delete        → propaga el DELETE del padre a los hijos en BD.
+    #     · delete-orphan → elimina hijos que se desvinculan del padre (ej: empleado.departamento = None).
+    #   El caso más crítico en producción es delete-orphan: si desvinculás un hijo
+    #   de su padre, SQLAlchemy lo elimina automáticamente de la BD.
+    #   Si no deseas ese comportamiento, usa solo cascade="all" sin delete-orphan.
 
-# ─── Modelo: Empleado ───
+    def __repr__(self) -> str:
+        return f"<DepartamentoModel id={self.id} nombre={self.nombre!r}>"
+    # __repr__ es el estándar profesional en modelos ORM. Sin él, al depurar o loguear
+    # un objeto obtienes algo inútil como <DepartamentoModel object at 0x7f3a...>.
+    # Con él, obtienes información accionable directamente en los logs y el debugger.
+    #
+    # Sobre el uso de !r:
+    # !r aplica repr() al valor, añadiendo comillas en strings ('Marketing') y distinguiendo
+    # None del string "None". Para tipos int y bool, !r es redundante — se representan
+    # igual con o sin él — por eso se omite en id y se reserva para campos de texto.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODELO: EMPLEADO (Entidad Hijo)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class EmpleadoModel(db.Model):
     __tablename__ = "empleados"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+
     nombre: Mapped[str] = mapped_column(String(100))
+
     email: Mapped[str] = mapped_column(String(120), unique=True)
+
     activo: Mapped[bool] = mapped_column(default=True)
+    # 'default' es una evaluación en el lado de Python (Application-side default).
+    # Si al instanciar el objeto no envías este campo, el ORM le inyecta 'True'
+    # en memoria justo antes de ejecutar el INSERT.
+    #
+    # ¿Por qué 'default' y no 'server_default'?
+    #   - default (Application-side): el ORM inyecta el valor en Python ANTES del INSERT.
+    #     Funciona aunque el INSERT no llegue a ejecutarse (ej: validación previa que falla).
+    #     Apropiado cuando solo Flask escribe en esta tabla.
+    #
+    #   - server_default (Database-side): el valor lo pone el motor SQL al ejecutar el INSERT.
+    #     Útil cuando múltiples aplicaciones distintas escriben en la misma BD (no solo Flask),
+    #     garantizando el valor por defecto independientemente del cliente que inserte.
+    #     Ejemplo: server_default=text("1") para BIT en SQL Server.
+    #
+    # Regla general: si solo Flask escribe en la BD → 'default'.
+    # Si hay otros sistemas escribiendo en la misma tabla → 'server_default'.
 
-    # Clave foránea moderna apuntando a la tabla 'departamentos'
-    departamento_id: Mapped[int] = mapped_column(ForeignKey("departamentos.id"))
+    # 🔗 Clave Foránea (Foreign Key)
+    departamento_id: Mapped[int] = mapped_column(ForeignKey("departamentos.id", ondelete="CASCADE"))
+    # Restricción física relacional. Vincula la columna al ID de la tabla 'departamentos'.
+    # El motor de BD rechazará cualquier valor que no exista en departamentos.id (IntegrityError).
+    #
+    # NOTA DE DISEÑO — El hijo está obligado de por vida a tener un padre:
+    # Al ser Mapped[int] (NOT NULL), esta columna nunca puede ser NULL en la BD.
+    # Desvincular un empleado de su departamento sin borrarlo (empleado.departamento = None)
+    # provocaría que SQLAlchemy intente UPDATE SET departamento_id = NULL,
+    # que la BD rechazará con un IntegrityError catastrófico en producción.
+    # Las únicas salidas válidas son:
+    #   1. Borrar al empleado explícitamente   → db.session.delete(empleado)
+    #   2. Reasignarlo a otro departamento     → empleado.departamento = otro_departamento
+    # Si el negocio requiriera empleados "flotantes" sin departamento, la sintaxis
+    # correcta sería Mapped[int | None], que genera una columna NULL en la BD.
+    #
+    # ondelete="CASCADE" — Cascada a nivel de Base de Datos (complementaria a SQLAlchemy):
+    # cascade="all, delete-orphan" en el Padre solo actúa si el borrado pasa por Flask.
+    # Si un DBA borra un departamento directamente en SQL Server con un comando SQL
+    # (DELETE FROM departamentos WHERE id = 1), la BD lanzará un error de clave foránea
+    # porque no sabe qué hacer con los empleados huérfanos — Flask no intervino.
+    # ondelete="CASCADE" instruye al propio motor SQL para que propague el borrado
+    # automáticamente, independientemente de si el DELETE vino de Flask o de una
+    # herramienta externa. Ambas cascadas coexisten con responsabilidades distintas:
+    #   - cascade="all, delete-orphan" → gestiona objetos en la sesión SQLAlchemy (Python).
+    #   - ondelete="CASCADE"           → gestiona filas directamente en el motor de BD (SQL).
 
-    # Relación inversa: Un empleado pertenece a UN departamento específico
-    # Mapped["DepartamentoModel"] le dice al editor de código que esto retorna una sola instancia
+    # 🔄 Relación Inversa (Hijo → Padre)
     departamento: Mapped["DepartamentoModel"] = relationship(
         back_populates="empleados"
     )
+    # - Mapped["DepartamentoModel"] (sin list) indica al IDE que retorna una única instancia.
+    # - NOTA DE DISEÑO: Aquí NO se usa cascade="all, delete-orphan". Las cascadas de
+    #   destrucción fluyen del Padre al Hijo, nunca al revés. Si eliminas a un empleado
+    #   (Hijo), no deseas bajo ningún concepto que se destruya el departamento entero
+    #   (Padre) y se purgue al resto de la plantilla.
 
-# ─── Explicación de la Sintaxis Moderna 2.0+ ───
-# Mapped[T]                  → Anotación de tipo que define el tipo de dato Python en el modelo.
-# mapped_column(...)         → Reemplaza al antiguo db.Column(). Declara restricciones físicas de la BD.
-# String(100) / ForeignKey   → Tipos y restricciones importados directamente de sqlalchemy core.
-# Mapped[str] vs Mapped[str | None] → Si el tipo permite None, la columna se genera como NULL; si no, es NOT NULL.
+    def __repr__(self) -> str:
+        return f"<EmpleadoModel id={self.id} email={self.email!r}>"
+    # !r se usa en email (str) para añadir comillas y distinguir None de "None".
+    # En id (int) se omite porque los enteros se representan igual con o sin él.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 GLOSARIO DE LA SINTAXIS MODERNA (2.0+)
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Mapped[T]:
+#    Anotación de tipo nativa de Python. Define el tipo de dato en memoria y la nulidad física:
+#      - Mapped[str]        → VARCHAR / TEXT NOT NULL (Obligatorio)
+#      - Mapped[str | None] → VARCHAR / TEXT NULL     (Opcional)
+#    El error si intentas guardar un NULL se evalúa en tiempo de commit (IntegrityError).
 #
-# ─── Relaciones Modernas (back_populates vs backref) ───
-# back_populates="atributo"  → Requiere que la relación esté definida explícitamente en AMBOS modelos.
-#                              Es superior a backref ya que proporciona autocompletado y tipado estático
-#                              en ambos extremos del mapeo, previniendo errores en tiempo de ejecución.
-# cascade="all, delete-orphan" → Propaga la eliminación del padre a los hijos huérfanos.
+# 2. mapped_column():
+#    Sustituye al antiguo 'db.Column()'. Configura las restricciones directamente en el motor
+#    de la base de datos (longitudes, índices, unicidad, defaults).
+#    Si se deja vacío [columna: Mapped[str] = mapped_column()], SQLAlchemy infiere el tipo
+#    de Python y crea una columna de texto ilimitado NOT NULL por defecto.
+#
+# 3. back_populates vs backref (El Estándar Actual):
+#    - 'backref' (Antiguo): declaraba la relación de forma "mágica" e invisible en la otra
+#      clase, rompiendo el autocompletado y el análisis estático con herramientas como Mypy.
+#    - 'back_populates' (Moderno): exige que la relación esté escrita explícitamente en los
+#      dos modelos, permitiendo que el IDE conozca de antemano qué tipos de datos se cruzan.
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🌐 REFERENCIA: Equivalencias de Tipado Físico según el Motor de BD
+# ─────────────────────────────────────────────────────────────────────────────
+# Al ejecutar db.create_all(), SQLAlchemy traduce Mapped[T] al dialecto del motor activo:
+#
+# | Tipo SQLAlchemy  | SQL Server (mssql)  | PostgreSQL (postgresql) | SQLite (sqlite)  |
+# | :---             | :---                | :---                    | :---             |
+# | Mapped[int]      | INT NOT NULL        | INTEGER NOT NULL        | INTEGER NOT NULL |
+# | Mapped[str]*     | VARCHAR(max)**      | TEXT NOT NULL           | TEXT NOT NULL    |
+# | String(100)      | VARCHAR(100)        | VARCHAR(100)            | VARCHAR(100)     |
+# | Mapped[bool]     | BIT NOT NULL        | BOOLEAN NOT NULL        | INTEGER NOT NULL |
+#
+# * Mapped[str] sin String(n): para columnas que se indexarán o compararán,
+#   siempre preferir String(n) explícito para controlar el tamaño físico.
+#
+# ** VARCHAR(max) en SQL Server permite hasta 2GB pero tiene restricciones:
+#    no puede usarse en índices estándar ni en claves únicas compuestas.
+#    Para columnas con unique=True o índices, es obligatorio usar String(n).
 
 # =================================================================================================================
 #              ▀▄▀▄▀▄⡷⠂ BLOQUE 5: SERVICIOS — LÓGICA DE NEGOCIO (SQLAlchemy 2.0+) ⠐⢾▀▄▀▄▀▄

@@ -637,87 +637,198 @@ class EmpleadoModel(db.Model):
 # 💡 Transacciones Modernas (SQLAlchemy 2.0):
 # En lugar de ensuciar el código con bloques try/except/commit/rollback repetitivos,
 # usamos el administrador de contexto `with db.session.begin():`.
-# Este patrón autocomita la transacción si el bloque finaliza con éxito, o hace 
+# Este patrón autocomita la transacción si el bloque finaliza con éxito, o hace
 # rollback automático si ocurre cualquier excepción, garantizando la integridad de la BD.
+#
+# ⚠️ TRAMPA ARQUITECTÓNICA — Transacciones Anidadas (InvalidRequestError):
+# db.session.begin() intenta iniciar una transacción en la sesión actual. Si en el
+# futuro compones funciones de servicio (ej: registrar_ingreso_empleado() llama a
+# crear_empleado() y luego a asignar_equipo()), cada función intentará abrir su propia
+# transacción. SQLAlchemy lanzará InvalidRequestError: "A transaction is already begun
+# on this session" porque no permite begin() anidado sobre una sesión activa.
+#
+# Soluciones según el escenario:
+#   - Funciones simples no compuestas (este archivo): db.session.begin() es correcto.
+#   - Funciones compuestas reutilizables: usar db.session.begin_nested() (Savepoints),
+#     que permite puntos de guardado parciales dentro de una transacción padre.
+#   - Arquitecturas avanzadas: delegar el ciclo de vida de la transacción (Unit of Work)
+#     a la capa superior (el framework/API en su ciclo de vida de la petición HTTP).
 
 from app import db
 from app.modulos.usuarios.models import EmpleadoModel, DepartamentoModel
 from sqlalchemy import select
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload, selectinload
 
-# ─── CREATE ───
+# ─────────────────────────────────────────────────────────────────────────────
+# ALLOWLIST DE CAMPOS ACTUALIZABLES
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Columnas físicas de la BD que pueden modificarse vía API.
+# Usamos __table__.columns en lugar de una lista manual porque se autoactualiza
+# si el modelo cambia — no hay que recordar actualizar dos sitios.
+# Esto excluye estrictamente relaciones ORM, métodos internos de SQLAlchemy
+# y atributos de infraestructura (ej: _sa_instance_state, metadata).
+# hasattr() NO es seguro para este propósito: devuelve True para cualquier
+# propiedad del objeto, incluyendo relaciones complejas y métodos internos.
+# Si el cliente envía {"departamento": "Marketing"}, hasattr() lo aprobaría
+# e intentaría machacar el objeto relacional con un string, rompiendo la app.
+CAMPOS_ACTUALIZABLES = {col.name for col in EmpleadoModel.__table__.columns}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CREATE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def crear_empleado(nombre: str, email: str, departamento_id: int) -> EmpleadoModel:
     nuevo = EmpleadoModel(nombre=nombre, email=email, departamento_id=departamento_id)
-    
-    # El context manager 'begin()' maneja automáticamente el ciclo de vida de la transacción.
+
+    # El context manager begin() maneja automáticamente el ciclo de vida de la transacción.
     # No es necesario llamar a db.session.commit() ni db.session.rollback() manualmente.
     with db.session.begin():
         db.session.add(nuevo)
-        
+
+    # NOTA: Tras el cierre del bloque begin(), SQLAlchemy expira los atributos del objeto.
+    # Si accedes a nuevo.id fuera del contexto, SQLAlchemy emitirá automáticamente un
+    # SELECT para refrescarlo (lazy load). Si la sesión ya está cerrada en ese momento,
+    # obtendrás un DetachedInstanceError. En Flask con scoped_session, la sesión vive
+    # durante toda la petición HTTP, por lo que este acceso es seguro dentro del request.
     return nuevo
 
 
-# ─── READ ───
+# ─────────────────────────────────────────────────────────────────────────────
+# READ
+# ─────────────────────────────────────────────────────────────────────────────
 
 def obtener_empleado(empleado_id: int) -> EmpleadoModel | None:
-    # db.session.get() es el método moderno y tipado para búsquedas por clave primaria
+    # db.session.get() es el método moderno y tipado para búsquedas por clave primaria.
+    # Internamente revisa primero el caché de la sesión (Identity Map) antes de ir a la BD.
     return db.session.get(EmpleadoModel, empleado_id)
 
 
 def obtener_todos() -> list[EmpleadoModel]:
-    # Sintaxis 2.0+: Construimos una sentencia (statement) con select() y la ejecutamos
+    # Sintaxis 2.0+: construimos una sentencia (statement) con select() y la ejecutamos.
+    # db.session.scalars() retorna un cursor iterable de objetos del modelo (no tuplas).
     stmt = select(EmpleadoModel)
+
+    # ⚠️ ADVERTENCIA DE ESCALABILIDAD: Esta función carga TODOS los registros en memoria.
+    # En producción con tablas grandes, usar paginación para evitar agotar la RAM:
+    #
+    # def obtener_todos(pagina: int = 1, por_pagina: int = 20) -> list[EmpleadoModel]:
+    #     stmt = select(EmpleadoModel).offset((pagina - 1) * por_pagina).limit(por_pagina)
+    #     return list(db.session.scalars(stmt).all())
     return list(db.session.scalars(stmt).all())
 
 
 def obtener_por_departamento(dep_nombre: str) -> list[EmpleadoModel]:
-    # Evitamos el problema de N+1 consultas usando 'joinedload' para traer
-    # de manera anticipada (Eager Loading) los empleados asociados al departamento.
+    # ─── El Problema N+1 y las Estrategias de Carga ───────────────────────────
+    #
+    # Sin Eager Loading (Lazy Loading por defecto):
+    # SQLAlchemy haría 1 consulta para traer el departamento. Luego, al iterar
+    # sobre sus empleados en un bucle, dispararía 1 consulta adicional POR CADA
+    # empleado (N consultas). Con 50 empleados → 51 consultas a la BD.
+    # Esto destruye el rendimiento por el coste de red (Network Roundtrips).
+    #
+    # joinedload — Eager Loading con JOIN (usado aquí):
+    # Emite 1 única consulta SQL combinando ambas tablas con LEFT OUTER JOIN.
+    # Trae el padre y todos los hijos en un solo viaje a la BD.
+    # Ideal para: relaciones *-a-uno, búsquedas unitarias, listas pequeñas (< ~100 registros).
+    # Limitación: en relaciones 1-a-muchos masivas, el JOIN duplica los datos del padre
+    # en cada fila del resultado, pudiendo saturar la memoria RAM.
+    #
+    # selectinload — La alternativa experta para colecciones grandes (SQLAlchemy 2.0+):
+    # Emite exactamente 2 consultas SQL:
+    #   1. SELECT * FROM departamentos WHERE nombre = ?
+    #   2. SELECT * FROM empleados WHERE departamento_id IN (id1, id2, ...)
+    # Evita la duplicación de datos del JOIN y es la recomendación oficial de
+    # SQLAlchemy 2.0+ para relaciones 1-a-muchos con colecciones grandes.
+    # Para usar: reemplazar joinedload(DepartamentoModel.empleados)
+    #        por selectinload(DepartamentoModel.empleados)
     stmt = (
         select(DepartamentoModel)
         .where(DepartamentoModel.nombre == dep_nombre)
         .options(joinedload(DepartamentoModel.empleados))
     )
+
+    # db.session.scalar() (singular) retorna directamente el primer resultado o None.
+    # ⚠️ PRECAUCIÓN: lanza MultipleResultsFound si la consulta devuelve más de una fila.
+    # Su uso es seguro aquí ÚNICAMENTE porque DepartamentoModel.nombre tiene unique=True,
+    # garantizando que la BD nunca retornará más de un resultado para esta búsqueda.
+    # En columnas que admitan duplicados, usar db.session.scalars(stmt).first() en su lugar,
+    # que retorna el primero silenciosamente sin lanzar excepción ante múltiples resultados.
     depto = db.session.scalar(stmt)
     return depto.empleados if depto else []
 
 
-# ─── UPDATE ───
+# ─────────────────────────────────────────────────────────────────────────────
+# UPDATE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def actualizar_empleado(empleado_id: int, datos_actualizados: dict) -> EmpleadoModel | None:
+    # La verificación de existencia ocurre FUERA del bloque transaccional.
+    # Hacerlo dentro con un `return None` prematuro provocaría que begin() ejecute
+    # un commit() vacío — un viaje innecesario al motor SQL sin nada que persistir.
+    # La transacción debe abrirse solo cuando hay una escritura real que realizar.
+    #
+    # TRADE-OFF — Race Condition residual:
+    # Existe una ventana de tiempo entre esta lectura y la escritura posterior donde
+    # otro proceso podría borrar el registro. En la práctica, este escenario es
+    # extremadamente improbable en APIs CRUD estándar. Si el negocio lo requiere,
+    # la solución es usar SELECT ... WITH (UPDLOCK) vía with_for_update() de SQLAlchemy,
+    # que bloquea la fila a nivel de BD durante la lectura.
     empleado = db.session.get(EmpleadoModel, empleado_id)
     if not empleado:
         return None
 
-    # Si ocurre un error al modificar los campos, 'begin()' revierte los cambios en la BD
+    # La transacción se abre solo si el empleado existe — limpia y sin commits vacíos.
+    # Iteramos solo sobre columnas físicas de la BD (CAMPOS_ACTUALIZABLES).
+    # Ver definición y justificación de la allowlist al inicio del archivo.
+    #
+    # ⚠️ OBJETO "SUCIO" EN RAM TRAS IntegrityError:
+    # begin() garantiza rollback automático en la BD si el commit falla (ej: email duplicado).
+    # Sin embargo, los atributos del objeto en la RAM de Python NO se revierten mágicamente.
+    # Si capturás el IntegrityError y seguís usando el objeto empleado en la misma sesión,
+    # sus atributos ya fueron mutados por setattr() con los valores nuevos.
+    # Solución: refrescar el objeto desde la BD antes de reutilizarlo:
+    #   db.session.refresh(empleado)  → recarga los valores reales desde la BD.
     with db.session.begin():
         for campo, valor in datos_actualizados.items():
-            if hasattr(empleado, campo):
+            if campo in CAMPOS_ACTUALIZABLES:
                 setattr(empleado, campo, valor)
-                
+
     return empleado
 
 
-# ─── DELETE ───
+# ─────────────────────────────────────────────────────────────────────────────
+# DELETE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def eliminar_empleado(empleado_id: int) -> bool:
+    # La verificación de existencia ocurre FUERA del bloque transaccional,
+    # por la misma razón que en actualizar_empleado: evitar un commit() vacío
+    # cuando el registro no existe. Ver comentario completo en actualizar_empleado.
     empleado = db.session.get(EmpleadoModel, empleado_id)
     if not empleado:
         return False
-        
+
+    # La transacción se abre solo si hay un objeto real que borrar.
     with db.session.begin():
         db.session.delete(empleado)
-        
+
     return True
 
-# ─── 🚀 ¿Por qué usar select() y db.session.execute() en 2.0? ───
-# 1. Separación de Conceptos: Separa la construcción de la query (stmt) de su ejecución física.
-# 2. Eager Loading Nativo: Facilita el uso de joinedload() y selectinload() de manera explícita.
-# 3. Consistencia con Async: La sintaxis de select() es idéntica en SQLAlchemy síncrono y asíncrono.
-# 4. Compatibilidad con Analizadores Estáticos: Permite que herramientas como Mypy validen tus queries.
 
-# ─── 💡 ¿Deberían los servicios lanzar excepciones? (Patrón DDD) ───
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 ¿Por qué usar select() y db.session.scalars() en 2.0?
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Separación de Conceptos: separa la construcción de la query (stmt) de su ejecución física.
+# 2. Eager Loading Nativo: facilita el uso de joinedload() y selectinload() de forma explícita.
+# 3. Consistencia con Async: la sintaxis de select() es idéntica en SQLAlchemy síncrono y asíncrono.
+# 4. Compatibilidad con Analizadores Estáticos: permite que herramientas como Mypy validen las queries.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 💡 ¿Deberían los servicios lanzar excepciones? (Patrón DDD)
+# ─────────────────────────────────────────────────────────────────────────────
 # En esta guía, los servicios retornan None o False cuando un recurso no existe,
 # y el controlador (routes.py) decide lanzar la excepción HTTP. Esto se llama
 # "Servicios Delgados" y es simple de aprender.
@@ -751,7 +862,6 @@ def eliminar_empleado(empleado_id: int) -> bool:
 # En este caso, el controlador (routes.py) se simplifica enormemente porque no necesita
 # verificar si el resultado es None: si el servicio no lanza excepción, todo salió bien.
 # El handler global (handlers.py) intercepta la excepción y responde con JSON estructurado.
-
 
 # =================================================================================================================
 #              ▀▄▀▄▀▄⡷⠂ BLOQUE 6: ESQUEMAS DE VALIDACIÓN CON PYDANTIC V2 ⠐⢾▀▄▀▄▀▄

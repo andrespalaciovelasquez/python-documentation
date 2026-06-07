@@ -705,7 +705,7 @@ def obtener_empleado(empleado_id: int) -> EmpleadoModel | None:
     return db.session.get(EmpleadoModel, empleado_id)
 
 
-def obtener_todos() -> list[EmpleadoModel]:
+def obtener_empleados() -> list[EmpleadoModel]:
     # Sintaxis 2.0+: construimos una sentencia (statement) con select() y la ejecutamos.
     # db.session.scalars() retorna un cursor iterable de objetos del modelo (no tuplas).
     stmt = select(EmpleadoModel)
@@ -713,7 +713,7 @@ def obtener_todos() -> list[EmpleadoModel]:
     # ⚠️ ADVERTENCIA DE ESCALABILIDAD: Esta función carga TODOS los registros en memoria.
     # En producción con tablas grandes, usar paginación para evitar agotar la RAM:
     #
-    # def obtener_todos(pagina: int = 1, por_pagina: int = 20) -> list[EmpleadoModel]:
+    # def obtener_empleados(pagina: int = 1, por_pagina: int = 20) -> list[EmpleadoModel]:
     #     stmt = select(EmpleadoModel).offset((pagina - 1) * por_pagina).limit(por_pagina)
     #     return list(db.session.scalars(stmt).all())
     return list(db.session.scalars(stmt).all())

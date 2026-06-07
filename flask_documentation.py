@@ -1045,52 +1045,114 @@ class EmpleadoResponseSchema(BaseModel):
 
 from typing import Any
 
+
 class AppError(Exception):
-    """Excepción base de la aplicación con tipado estricto."""
+    """Excepción base de la aplicación con tipado estricto.
+
+    PRECONDICIÓN DE DISEÑO: Toda subclase de AppError debe definir 'mensaje' y
+    'status_code' como atributos de clase para mantener consistencia. Si no lo hace,
+    heredará los valores por defecto (500, "Error interno...") de esta clase base.
+    """
     status_code: int = 500
     mensaje: str = "Error interno del servidor."
 
     def __init__(
-        self, 
-        mensaje: str | None = None, 
-        status_code: int | None = None, 
+        self,
+        mensaje: str | None = None,
+        status_code: int | None = None,
         detalles: list[dict[str, Any]] | dict[str, Any] | None = None
     ):
-        super().__init__()
         if mensaje is not None:
             self.mensaje = mensaje
         if status_code is not None:
             self.status_code = status_code
         self.detalles = detalles
 
+        # Obligatorio para que str(error) retorne texto útil en logs, Celery y pytest.
+        # Sin esto, str(error) devuelve '' — inutilizable para depuración fuera del handler.
+        super().__init__(self.mensaje)
+
+
+class ValidacionError(AppError):
+    status_code = 422
+    mensaje = "La validación de la lógica de negocio ha fallado."
+    # LIMITE ARQUITECTONICO (Pydantic vs ValidacionError):
+    # - PydanticValidationError (automático): cuando el payload tiene tipo o formato
+    #   incorrecto (campo faltante, email malformado, tipo de dato erróneo).
+    #   Lo maneja handle_pydantic_validation_error() en handlers.py sin intervención manual.
+    # - ValidacionError (manual en services.py): cuando los datos pasaron Pydantic
+    #   pero violan reglas de negocio. Ejemplo: "El departamento_id es un entero
+    #   válido, pero corresponde a un departamento que está cerrado/inactivo".
+
+
 class RecursoNoEncontradoError(AppError):
     status_code = 404
     mensaje = "El recurso solicitado no fue encontrado."
 
-class ValidacionError(AppError):
-    status_code = 400
-    mensaje = "La validación de los datos ha fallado."
 
 class ConflictoError(AppError):
     status_code = 409
-    mensaje = "El recurso ya existe o genera un conflicto."
+    mensaje = "El recurso ya existe o genera un conflicto de estado."
 
+
+# ─── Excepciones de Seguridad (Preparadas para la capa de Autenticación) ─────
+# Definidas aquí aunque se usen en los Bloques 12-14, porque la jerarquía de
+# errores debe estar completa desde el principio — añadirlas después obliga
+# a modificar handlers y tests ya escritos.
+
+class NoAutenticadoError(AppError):
+    status_code = 401
+    mensaje = "Autenticación requerida. Token faltante o inválido."
+
+
+class NoAutorizadoError(AppError):
+    status_code = 403
+    mensaje = "No tienes permisos suficientes para realizar esta acción."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 ARCHIVO: app/errors/handlers.py
 # ─────────────────────────────────────────────────────────────────────────────
 # Los handlers interceptan las excepciones lanzadas en cualquier parte de la app.
-# Incorporamos observabilidad (logging) y soporte nativo para fallas de validación de Pydantic.
+# Incorporamos observabilidad (logging) y garantizamos una API JSON 100% pura.
+#
+# ORDEN DE REGISTRO DE HANDLERS (Crítico para la precedencia):
+# Flask resuelve los handlers del MAS ESPECIFICO al MAS GENERICO.
+# El orden físico de los decoradores en este archivo debe ser:
+#   1. AppError                  (Específico - Errores propios de negocio)
+#   2. PydanticValidationError   (Específico - Errores de schemas)
+#   3. HTTPException             (Genérico   - Errores de enrutamiento de Flask/Werkzeug)
+#   4. Exception                 (Genérico   - Red de seguridad final para HTTP 500)
+# Invertir este registro podría causar que Exception capture errores específicos
+# antes de que lleguen a su formateador adecuado.
+#
+# app_errorhandler() vs errorhandler():
+# - errorhandler() registra el handler SOLO para las rutas de este Blueprint específico.
+# - app_errorhandler() lo registra GLOBALMENTE para toda la aplicación Flask.
+# Esto permite mantener los handlers separados en su propio módulo (Clean Code)
+# sin acoplarlos directamente al objeto 'app' en el Factory Pattern (Bloque 9).
 
-from flask import Blueprint, current_app
+from flask import Blueprint, current_app, jsonify
+from werkzeug.exceptions import HTTPException
 from pydantic import ValidationError as PydanticValidationError
 from app.errors.exceptions import AppError
 
 errors_bp = Blueprint("errors", __name__)
 
+
 @errors_bp.app_errorhandler(AppError)
 def handle_app_error(error: AppError):
     """Captura errores de negocio controlados (herederos de AppError)."""
+
+    # SEVERIDAD DE LOGS DINÁMICA:
+    # Distinguimos entre errores de cliente (4xx - Warning) y fallos graves del
+    # servidor lanzados explícitamente vía AppError (5xx - Error con traceback).
+    if error.status_code >= 500:
+        current_app.logger.error(
+            "AppError [%s]: %s", error.status_code, error.mensaje, exc_info=True
+        )
+    else:
+        current_app.logger.warning("AppError [%s]: %s", error.status_code, error.mensaje)
+
     response = {
         "status": "error",
         "error": error.__class__.__name__,
@@ -1098,15 +1160,18 @@ def handle_app_error(error: AppError):
     }
     if error.detalles is not None:
         response["detalles"] = error.detalles
-    return response, error.status_code
+
+    # jsonify() garantiza siempre el header 'Content-Type: application/json'.
+    return jsonify(response), error.status_code
 
 
 @errors_bp.app_errorhandler(PydanticValidationError)
 def handle_pydantic_validation_error(error: PydanticValidationError):
-    """Soluciona el choque Flask/Pydantic.
-    
-    Cuando la validación de un Schema de Pydantic falla, se lanza una excepción nativa
-    que este handler intercepta globalmente para responder un HTTP 400 estructurado.
+    """Soluciona el choque Flask/Pydantic, retornando HTTP 422.
+
+    Cuando la validación de un schema de Pydantic falla, se lanza una excepción
+    nativa que este handler intercepta globalmente para responder con JSON estructurado
+    en lugar de una página HTML o un traceback expuesto al cliente.
     """
     detalles = [
         {
@@ -1116,30 +1181,60 @@ def handle_pydantic_validation_error(error: PydanticValidationError):
         }
         for err in error.errors()
     ]
-    return {
+
+    current_app.logger.warning("Pydantic ValidationError: %s", detalles)
+
+    return jsonify({
         "status": "error",
         "error": "ValidacionError",
         "mensaje": "La validación de los datos de entrada ha fallado.",
         "detalles": detalles
-    }, 400
+    }), 422
 
 
-@errors_bp.app_errorhandler(404)
-def handle_not_found(error):
-    """Intercepta errores 404 nativos de Flask (rutas no existentes)."""
-    return {"status": "error", "mensaje": "La ruta solicitada no existe."}, 404
+@errors_bp.app_errorhandler(HTTPException)
+def handle_http_exception(error: HTTPException):
+    """Blindaje anti-HTML para errores nativos de Flask y Werkzeug.
+
+    Captura errores de enrutamiento (404, 405, 415, etc.) y fuerza la respuesta
+    en JSON, reemplazando las páginas HTML que Flask devuelve por defecto.
+    Elimina la necesidad de handlers manuales individuales por cada código HTTP.
+    """
+    current_app.logger.warning("HTTPException [%s]: %s", error.code, error.description)
+
+    return jsonify({
+        "status": "error",
+        "error": error.name,
+        "mensaje": error.description
+    }), error.code
 
 
 @errors_bp.app_errorhandler(Exception)
 def handle_unhandled_exception(error: Exception):
-    """Garantiza observabilidad y seguridad para excepciones no controladas (HTTP 500).
-    
-    Registra el traceback completo en los archivos de logs del sistema para auditoría
-    y depuración, previniendo la fuga de detalles internos hacia el cliente.
-    """
-    current_app.logger.error("Excepción no controlada detectada: %s", error, exc_info=True)
-    return {"status": "error", "mensaje": "Ha ocurrido un error interno en el servidor."}, 500
+    """Red de seguridad final para excepciones no controladas (HTTP 500).
 
+    Registra el traceback completo en los logs para auditoría y depuración,
+    sin exponer detalles internos al cliente.
+    """
+    # PROGRAMACION DEFENSIVA: redirección manual de precedencias.
+    # En caso de colisión en el registro de blueprints, aseguramos que el handler
+    # genérico no silencie los formateadores estructurados de errores específicos.
+    if isinstance(error, AppError):
+        return handle_app_error(error)
+    if isinstance(error, HTTPException):
+        return handle_http_exception(error)
+    if isinstance(error, PydanticValidationError):
+        return handle_pydantic_validation_error(error)
+
+    # Texto plano estructurado — sin emojis — para compatibilidad total con
+    # parsers de observabilidad en producción (Datadog, ELK, CloudWatch).
+    current_app.logger.error("Excepcion no controlada: %s", error, exc_info=True)
+
+    return jsonify({
+        "status": "error",
+        "error": "InternalServerError",
+        "mensaje": "Ha ocurrido un error interno en el servidor."
+    }), 500
 
 # =================================================================================================================
 #              ▀▄▀▄▀▄⡷⠂ BLOQUE 8: RUTAS Y CONTROLADORES ⠐⢾▀▄▀▄▀▄

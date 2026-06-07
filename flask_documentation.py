@@ -873,62 +873,160 @@ def eliminar_empleado(empleado_id: int) -> bool:
 # Pydantic provee validación de datos con tipado estático en tiempo de ejecución.
 # Definimos esquemas de ENTRADA (lo que el cliente envía) y de SALIDA
 # (lo que le respondemos, ocultando datos sensibles como contraseñas).
+#
+# Flujo de datos:
+#   Cliente → JSON → Schema de Entrada (valida estrictamente) → Service (opera) → Model ORM
+#   Model ORM → Schema de Salida (serializa sin revalidar)    → JSON → Cliente
+#
+# Principio fundamental:
+#   - Schemas de ENTRADA → estrictos: validan tipos, longitudes, formatos y campos extra.
+#     Desconfiamos del cliente. Todo dato externo es potencialmente malicioso o malformado.
+#   - Schemas de SALIDA  → permisivos: solo serializan. Los datos vienen de la BD,
+#     ya fueron validados al entrar. Revalidarlos añade latencia sin ningún beneficio.
+#     Usar tipos primitivos (str, int, bool) en lugar de tipos validadores (EmailStr, NombreEmpleado).
 
 from typing import Annotated
-from pydantic import BaseModel, Field, EmailStr, ConfigDict
+from pydantic import BaseModel, Field, EmailStr, ConfigDict, model_validator
 
-# ─── 💡 Patrón DRY: Tipos Reutilizables con Annotated ───
-# En Pydantic moderno, en vez de duplicar las restricciones Field(...) en múltiples schemas
-# (Create, Update, etc.), encapsulamos las reglas en tipos personalizados utilizando Annotated.
-# Si el día de mañana cambias la longitud mínima del nombre, solo lo modificas aquí.
-NombreEmpleado = Annotated[str, Field(min_length=3, max_length=100)]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TIPOS REUTILIZABLES (Patrón DRY con Annotated)
+# ─────────────────────────────────────────────────────────────────────────────
+# En Pydantic v2, encapsulamos las reglas de validación en tipos personalizados
+# con Annotated en lugar de duplicar Field(...) en múltiples schemas.
+# Si el día de mañana cambia la longitud mínima del nombre, solo se modifica aquí.
+#
+# strip_whitespace=True: recorta espacios al inicio y al final automáticamente
+# antes de que el dato llegue a la capa de servicios o a la BD.
+# Previene bugs silenciosos de búsqueda: un nombre guardado como ' Juan '
+# no aparecería en WHERE nombre = 'Juan'. Los usuarios y frontends
+# siempre cometen este tipo de errores — mejor sanitizar en la entrada.
+#
+# Estos tipos solo se usan en schemas de ENTRADA. En schemas de SALIDA
+# se usan tipos primitivos (str, int) para evitar revalidación innecesaria.
+NombreEmpleado = Annotated[str, Field(min_length=3, max_length=100, strip_whitespace=True)]
 IdDepartamento = Annotated[int, Field(gt=0)]
 
 
-# ─── Esquemas de Entrada (Request Payloads) ───
+# ─────────────────────────────────────────────────────────────────────────────
+# BASE DE ENTRADA (Patrón DRY para schemas de entrada)
+# ─────────────────────────────────────────────────────────────────────────────
 
-class EmpleadoCreateSchema(BaseModel):
+class BaseInputSchema(BaseModel):
+    """Clase base para todos los schemas de entrada de la API.
+
+    Centraliza la política de seguridad de entrada en un único lugar.
+    Si en el futuro se necesita añadir una directiva global (ej: str_strip_whitespace,
+    populate_by_name, o cualquier otra opción de ConfigDict), se modifica aquí
+    y todos los schemas de entrada la heredan automáticamente — sin tocar 40 clases.
+    """
+    model_config = ConfigDict(
+        extra="forbid",
+        # extra="forbid": rechaza cualquier campo no declarado en el schema con un 422.
+        # Patrón Fail-Fast defensivo: un campo mal escrito (departemento_id) o un intento
+        # de inyectar campos no documentados (es_admin: true) falla de forma ruidosa.
+        # IMPORTANTE: solo aplica a schemas de ENTRADA. En schemas de SALIDA, extra="forbid"
+        # rompería la serialización si la BD tiene columnas adicionales no declaradas.
+        from_attributes=True,
+        # from_attributes=True incluido en la base de forma preventiva: permite construir
+        # cualquier schema de entrada desde un objeto ORM si fuera necesario en tests
+        # o flujos internos, sin necesidad de recordar añadirlo en cada subclase.
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEMAS DE ENTRADA (Request Payloads)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EmpleadoCreateSchema(BaseInputSchema):
     """Valida los datos recibidos en el POST de creación."""
+
     nombre: NombreEmpleado
     email: EmailStr
     departamento_id: IdDepartamento
 
 
-class EmpleadoUpdateSchema(BaseModel):
-    """Permite actualización parcial. Todos los campos son opcionales sin duplicar restricciones."""
+class EmpleadoUpdateSchema(BaseInputSchema):
+    """Permite actualización parcial (PATCH). Todos los campos son opcionales
+    sin duplicar restricciones gracias a los tipos Annotated reutilizables."""
+
     nombre: NombreEmpleado | None = None
     email: EmailStr | None = None
     departamento_id: IdDepartamento | None = None
 
+    @model_validator(mode="after")
+    def al_menos_un_campo(self) -> "EmpleadoUpdateSchema":
+        # Sin este validador, un cliente puede enviar {} (JSON vacío) y Pydantic
+        # lo acepta porque todos los campos son opcionales. El servicio no actualizaría
+        # nada, haría un commit vacío y retornaría éxito — comportamiento silenciosamente
+        # incorrecto que confunde al cliente y desperdicia recursos en la BD.
+        #
+        # ¿Por qué model_fields_set y no any()?
+        # any([self.nombre, self.email, self.departamento_id]) evalúa truthiness de Python.
+        # Valores como False, 0 o "" son falsy — any() los trataría como "campo no enviado"
+        # y rechazaría actualizaciones perfectamente válidas. Ejemplo: si en el futuro
+        # se añade activo: bool | None = None y el cliente envía {"activo": false}
+        # para suspender un empleado, any() evaluaría [None, None, None, False] → False
+        # y lanzaría el error rechazando una petición completamente válida.
+        #
+        # model_fields_set es la propiedad nativa de Pydantic v2 diseñada exactamente
+        # para este caso: devuelve el conjunto de campos que el cliente envió
+        # explícitamente en el JSON, sin importar si su valor es False, 0, "" o None.
+        if not self.model_fields_set:
+            raise ValueError("Se debe enviar al menos un campo para actualizar.")
+        return self
 
-# ─── Esquemas de Salida (Response Payloads) ───
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEMAS DE SALIDA (Response Payloads)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class DepartamentoResponseSchema(BaseModel):
     """Esquema para serializar los datos básicos del departamento."""
-    id: int
-    nombre: str
 
     model_config = ConfigDict(from_attributes=True)
+    # from_attributes=True permite a Pydantic leer directamente instancias ORM
+    # de SQLAlchemy, eliminando la necesidad de métodos manuales como to_dict().
+
+    id: int
+    nombre: str
+    # str en lugar de NombreEmpleado: los datos de salida provienen de la BD
+    # y ya fueron validados al entrar. Revalidar longitudes en cada serialización
+    # añade latencia sin beneficio. Si un dato histórico en la BD no cumpliera
+    # las restricciones, Pydantic lanzaría un error de serialización inesperado.
 
 
 class EmpleadoResponseSchema(BaseModel):
     """Estructura la respuesta enviada al cliente.
-    
-    Aprovecha la consulta joinedload() del Bloque 5 para incluir de forma anidada 
-    la información del departamento de manera óptima, evitando peticiones HTTP adicionales.
-    """
-    id: int
-    nombre: NombreEmpleado
-    email: EmailStr  # Mantiene consistencia semántica completa con la entrada
-    activo: bool
-    departamento_id: IdDepartamento
-    
-    # Objeto anidado opcional para exponer la relación cargada con joinedload
-    departamento: DepartamentoResponseSchema | None = None
 
-    # from_attributes=True permite a Pydantic leer directamente instancias ORM de SQLAlchemy
-    # (eliminando la necesidad de crear y mantener métodos manuales de serialización como to_dict())
+    Aprovecha la consulta joinedload() / selectinload() del Bloque 5 para incluir
+    de forma anidada la información del departamento, evitando peticiones HTTP adicionales.
+    """
+
     model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    nombre: str          # str primitivo: solo serializar, sin revalidar longitud.
+    email: str           # str en lugar de EmailStr: evita ejecutar regex de validación
+                         # de email en cada respuesta. Con 10.000 empleados en una lista,
+                         # esa regex se ejecutaría 10.000 veces añadiendo latencia innecesaria.
+    activo: bool
+    departamento_id: int # int primitivo: solo serializar, sin revalidar gt=0.
+
+    # ─── ⚠️ ADVERTENCIA CRÍTICA — N+1 SILENCIOSO EN PYDANTIC ──────────────────
+    # from_attributes=True hace que Pydantic acceda a los atributos del objeto ORM
+    # mediante getattr(empleado, 'departamento') al serializar.
+    # Si la relación 'departamento' NO fue precargada con joinedload() o selectinload()
+    # en la capa de servicios, SQLAlchemy interceptará ese getattr y disparará una
+    # consulta SELECT adicional por cada empleado serializado — el problema N+1
+    # reaparece silenciosamente en la capa de serialización, donde nadie lo buscaría.
+    #
+    # CONTRATO OBLIGATORIO CON services.py:
+    # Toda consulta que retorne EmpleadoResponseSchema con departamento anidado
+    # DEBE usar joinedload() o selectinload() en la capa de servicios.
+    # Si no se necesita el departamento anidado, usar departamento: None explícito
+    # o crear un schema de respuesta simplificado sin este campo.
+    departamento: DepartamentoResponseSchema | None = None
 
 
 # =================================================================================================================

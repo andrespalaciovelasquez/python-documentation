@@ -1237,15 +1237,25 @@ def handle_unhandled_exception(error: Exception):
     }), 500
 
 # =================================================================================================================
-#              ▀▄▀▄▀▄⡷⠂ BLOQUE 8: RUTAS Y CONTROLADORES ⠐⢾▀▄▀▄▀▄
+#              ▀▄▀▄▀▄⡷⠂ BLOQUE 8: RUTAS Y CONTROLADORES (Blueprints REST) ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 ARCHIVO: app/modulos/usuarios/routes.py
 # ─────────────────────────────────────────────────────────────────────────────
-# El controlador es la capa que recibe las peticiones HTTP, orquesta la validación
-# con schemas, delega la lógica a services, y responde al cliente.
+# El controlador es la capa más delgada de la arquitectura. Su ÚNICA responsabilidad
+# es orquestar: recibe la petición HTTP, delega la validación a los schemas (Bloque 6),
+# la lógica de negocio a los services (Bloque 5), y formatea la respuesta al cliente.
+#
+# 💡 Principio Clave — El controlador NO contiene lógica de negocio:
+# Si mañana necesitas exponer la misma funcionalidad vía CLI, GraphQL o un worker
+# de Celery, la lógica reside en services.py y es reutilizable. El controlador
+# es solo un adaptador HTTP desechable.
+#
 # Usamos Blueprints para modularizar las rutas por dominio de negocio.
+# Un Blueprint es un objeto que agrupa rutas, error handlers y hooks de forma
+# aislada, permitiendo que cada módulo (usuarios, productos, reportes) se registre
+# independientemente en el Factory Pattern (Bloque 9).
 
 from flask import Blueprint, request, make_response, session, abort, redirect, url_for
 from pydantic import TypeAdapter
@@ -1253,54 +1263,126 @@ from app.modulos.usuarios import services
 from app.modulos.usuarios.schemas import EmpleadoCreateSchema, EmpleadoUpdateSchema, EmpleadoResponseSchema
 from app.errors.exceptions import RecursoNoEncontradoError, ValidacionError
 
-# ─── Definición del Blueprint ───
-# Un Blueprint agrupa rutas de forma aislada para que cada módulo de negocio
-# (ej: usuarios, productos, reportes) tenga su propio Blueprint.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEFINICIÓN DEL BLUEPRINT
+# ─────────────────────────────────────────────────────────────────────────────
 
 usuarios_bp = Blueprint("usuarios", __name__, url_prefix="/api/v1/usuarios")
+# Blueprint("usuarios", __name__, url_prefix="/api/v1/usuarios"):
+#   - "usuarios"    → Nombre interno del Blueprint. Se usa en url_for("usuarios.listar_usuarios").
+#   - __name__      → Módulo donde reside el Blueprint (para localizar templates y static).
+#   - url_prefix    → Prefijo automático para TODAS las rutas de este Blueprint.
+#                     Evita repetir "/api/v1/usuarios" en cada @route. Si la versión
+#                     de la API cambia a v2, solo se modifica aquí.
+#
+# Convención REST para el prefijo:
+#   /api       → Namespace que separa la API de posibles rutas de frontend.
+#   /v1        → Versionado de API. Permite mantener /v1 estable mientras /v2 evoluciona.
+#   /usuarios  → Recurso en plural (convención REST universal).
 
 
-# ─── GET /api/v1/usuarios/ — Listar todos ───
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINTS CRUD — API REST
+# ─────────────────────────────────────────────────────────────────────────────
+# Cada endpoint sigue un flujo idéntico y predecible (Consistencia Arquitectónica):
+#   1. Extraer datos del request      → request.get_json()
+#   2. Validar con Pydantic           → Schema(**data) — errores capturados por handlers (Bloque 7)
+#   3. Delegar a services             → services.crear_empleado(...) — lógica pura (Bloque 5)
+#   4. Serializar con schema de salida → EmpleadoResponseSchema.model_validate() (Bloque 6)
+#   5. Si algo falla                  → raise ExcepciónPersonalizada() → handler global responde
+#
+# Este patrón hace que cada nuevo endpoint sea predecible y fácil de revisar en code review.
+
+
+# ─── GET /api/v1/usuarios/ — Listar todos ────────────────────────────────────
 
 @usuarios_bp.route("/")
 def listar_usuarios():
-    empleados = services.obtener_todos()
-    # Pydantic v2 introduce TypeAdapter para validar y serializar colecciones completas
-    # de forma masiva y altamente optimizada, mapeando todo a una lista de diccionarios.
+    """Retorna la lista completa de empleados con sus departamentos anidados.
+
+    Serialización masiva: usa TypeAdapter en lugar de model_validate() individual
+    porque optimiza la validación de colecciones completas en una sola pasada,
+    evitando el overhead de instanciar un schema por cada elemento del iterable.
+    """
+    empleados = services.obtener_empleados()
+
+    # TypeAdapter vs model_validate — Cuándo usar cada uno:
+    #   - model_validate(obj)          → Un solo objeto. Retorna una instancia del schema.
+    #   - TypeAdapter(list[Schema]).dump_python(lista) → Colección completa. Retorna una
+    #     lista de diccionarios directamente, optimizado internamente por Pydantic v2
+    #     con validación en lote (batch). Ideal para endpoints de listado.
+    #
+    # dump_python() serializa SIN revalidar (mode="python" por defecto).
+    # Los datos provienen de la BD y ya fueron validados al entrar (principio del Bloque 6).
     resultado = TypeAdapter(list[EmpleadoResponseSchema]).dump_python(empleados)
     return {"usuarios": resultado}
 
 
-# ─── GET /api/v1/usuarios/<id> — Obtener uno ───
+# ─── GET /api/v1/usuarios/<id> — Obtener uno ─────────────────────────────────
 
 @usuarios_bp.route("/<int:usuario_id>")
-def obtener_usuario(usuario_id):
+def obtener_usuario(usuario_id: int):
+    """Retorna un empleado por su ID o lanza 404 si no existe.
+
+    Usa model_validate() (objeto individual) en lugar de TypeAdapter (colección).
+    model_validate() retorna una instancia del schema que luego se serializa
+    a diccionario con model_dump() para la respuesta JSON.
+    """
     empleado = services.obtener_empleado(usuario_id)
     if not empleado:
+        # Lanzamos la excepción del Bloque 7 en lugar de usar abort(404).
+        # Ventaja: el handler global (handlers.py) responde con JSON estructurado
+        # consistente. abort(404) delegaría al handler de HTTPException, que tiene
+        # un formato genérico sin el mensaje personalizado del recurso.
         raise RecursoNoEncontradoError(f"Usuario con ID {usuario_id} no existe.")
+
     return EmpleadoResponseSchema.model_validate(empleado).model_dump()
 
 
-# ─── POST /api/v1/usuarios/ — Crear ───
+# ─── POST /api/v1/usuarios/ — Crear ──────────────────────────────────────────
 
 @usuarios_bp.route("/", methods=["POST"])
 def crear_usuario():
-    # Instanciamos el esquema directamente desempaquetando el JSON (ya pre-parseado a dict por Flask).
-    # Cualquier ValidationError de Pydantic será interceptado por el handler global.
+    """Crea un nuevo empleado validando el payload con Pydantic.
+
+    Flujo de datos (Bloque 6 → Bloque 5 → Bloque 4):
+      JSON del cliente → EmpleadoCreateSchema (valida) → services.crear_empleado()
+      → EmpleadoModel (persiste en BD) → EmpleadoResponseSchema (serializa) → JSON
+    """
+    # request.get_json() or {} — Patrón Defensivo:
+    # Si el cliente envía un body vacío o un Content-Type incorrecto (ej: text/plain),
+    # get_json() retorna None. Sin el `or {}`, desempaquetar **None lanzaría
+    # TypeError("argument of type 'NoneType' is not iterable") — un error críptico
+    # que no pasaría por el handler de Pydantic. Con `or {}`, Pydantic recibe un
+    # diccionario vacío y lanza un ValidationError claro: "field required".
     datos_validados = EmpleadoCreateSchema(**(request.get_json() or {}))
-    
+
+    # model_dump() convierte el schema Pydantic a dict plano {nombre, email, departamento_id}
+    # que se desempaqueta como argumentos nombrados del servicio.
     nuevo = services.crear_empleado(**datos_validados.model_dump())
     return EmpleadoResponseSchema.model_validate(nuevo).model_dump(), 201
+    # HTTP 201 Created: convención REST para indicar que el recurso fue creado exitosamente.
 
 
-# ─── PUT /api/v1/usuarios/<id> — Actualizar ───
+# ─── PUT /api/v1/usuarios/<id> — Actualizar ──────────────────────────────────
 
 @usuarios_bp.route("/<int:usuario_id>", methods=["PUT"])
-def actualizar_usuario(usuario_id):
-    # La validación fluye directo al handler global ante datos inválidos
+def actualizar_usuario(usuario_id: int):
+    """Actualiza parcialmente un empleado existente.
+
+    NOTA DE DISEÑO — PUT vs PATCH:
+    Aunque usamos PUT, el comportamiento real es de PATCH (actualización parcial)
+    gracias a exclude_none=True. En REST estricto, PUT reemplaza el recurso completo
+    y PATCH aplica cambios parciales. En la práctica, muchas APIs usan PUT para ambos
+    casos por simplicidad. Si el equipo requiere semántica estricta, cambiar a PATCH.
+    """
     datos_validados = EmpleadoUpdateSchema(**(request.get_json() or {}))
-    
-    # exclude_none=True: solo envía los campos que el cliente realmente proporcionó
+
+    # exclude_none=True: solo envía los campos que el cliente realmente proporcionó.
+    # Si el cliente envió {"nombre": "Nuevo"}, el dict resultante es {"nombre": "Nuevo"}.
+    # Los campos no enviados (None por defecto en EmpleadoUpdateSchema) se excluyen,
+    # evitando sobrescribir datos existentes con NULL en la BD.
     campos_a_actualizar = datos_validados.model_dump(exclude_none=True)
     if not campos_a_actualizar:
         raise ValidacionError("No se proporcionaron campos para actualizar.")
@@ -1312,157 +1394,215 @@ def actualizar_usuario(usuario_id):
     return EmpleadoResponseSchema.model_validate(actualizado).model_dump()
 
 
-# ─── DELETE /api/v1/usuarios/<id> — Eliminar ───
+# ─── DELETE /api/v1/usuarios/<id> — Eliminar ─────────────────────────────────
 
 @usuarios_bp.route("/<int:usuario_id>", methods=["DELETE"])
-def eliminar_usuario(usuario_id):
+def eliminar_usuario(usuario_id: int):
+    """Elimina un empleado por su ID. Retorna 204 No Content en caso de éxito.
+
+    HTTP 204 No Content es la convención REST para DELETE exitoso:
+    el recurso fue eliminado, no hay cuerpo en la respuesta. El string vacío ""
+    es obligatorio porque Flask no permite retornar None como cuerpo.
+    """
     eliminado = services.eliminar_empleado(usuario_id)
     if not eliminado:
         raise RecursoNoEncontradoError(f"Usuario con ID {usuario_id} no existe.")
     return "", 204
 
 
-# ─── Explicación del flujo CRUD ───
-# Observa cómo cada ruta sigue el mismo patrón limpio:
-#   1. Extraer datos del request (request.json)
-#   2. Validar con Pydantic (Schema(**data))
-#   3. Delegar a services (services.crear_empleado(...))
-#   4. Serializar respuesta con schema de salida (EmpleadoResponseSchema.model_validate())
-#   5. Si algo falla → raise ExcepciónPersonalizada() → el handler responde automáticamente
-
-
-# ─── EJEMPLOS DIDÁCTICOS DE OTROS CASOS DE USO ───
-
-# ─── El Objeto request — Acceso a Datos de la Petición ───
-# Flask provee un proxy seguro 'request' que contiene toda la información
-# de la petición HTTP entrante. Estos son los atributos más usados:
+# ─────────────────────────────────────────────────────────────────────────────
+# REFERENCIA DIDÁCTICA: EL OBJETO REQUEST
+# ─────────────────────────────────────────────────────────────────────────────
+# Flask provee un proxy thread-safe 'request' que contiene toda la información
+# de la petición HTTP entrante. Es un proxy porque cada hilo de ejecución
+# accede a su propia petición aislada — no es una variable global compartida.
+# Internamente usa el mecanismo de LocalStack de Werkzeug.
 
 @usuarios_bp.route("/ejemplo-request", methods=["GET", "POST"])
 def ejemplo_request():
+    """Demuestra los atributos principales del objeto request de Flask."""
     if request.method == "GET":
-        # Query params de la URL (ej: ?limite=10&pagina=2)
+        # ── Query Parameters (URL: ?limite=10&pagina=2) ──
+        # request.args es un ImmutableMultiDict que parsea la query string.
+        # El parámetro 'type' convierte automáticamente y retorna 'default'
+        # si la conversión falla (ej: ?limite=abc → retorna 20 sin error).
         limite = request.args.get("limite", default=20, type=int)
         pagina = request.args.get("pagina", default=1, type=int)
         return {"limite": limite, "pagina": pagina}
 
     elif request.method == "POST":
-        # Payload JSON del body
+        # ── Payload JSON (Content-Type: application/json) ──
         datos_json = request.json                        # Equivalente a request.get_json()
-        # Formulario HTML (Content-Type: application/x-www-form-urlencoded)
+
+        # ── Formulario HTML (Content-Type: application/x-www-form-urlencoded) ──
         nombre = request.form.get("nombre")
-        # Headers HTTP
+
+        # ── Headers HTTP ──
         token = request.headers.get("Authorization")
-        # IP del cliente
+
+        # ── IP del Cliente ──
+        # ⚠️ PRECAUCIÓN: detrás de un proxy reverso (Nginx, AWS ALB), remote_addr
+        # devuelve la IP del proxy, no la del cliente real. Usar request.access_route[0]
+        # o el header X-Forwarded-For con precaución (puede ser falsificado).
         ip = request.remote_addr
 
         return {"recibido": True}, 201
 
 
-# ─── Construir Respuestas HTTP ───
-# Flask permite responder con diferentes estructuras:
+# ─────────────────────────────────────────────────────────────────────────────
+# REFERENCIA DIDÁCTICA: CONSTRUCCIÓN DE RESPUESTAS HTTP
+# ─────────────────────────────────────────────────────────────────────────────
+# Flask ofrece múltiples formas de construir respuestas. Cada una tiene un caso
+# de uso específico, desde respuestas simples hasta descargas de archivos.
 
-# 1. Un string simple → asume HTML con código 200
+# 1. String simple → asume HTML con código 200
 #    return "Hola Mundo"
 
-# 2. Un diccionario directo (Flask 1.1+) → serializa automáticamente a JSON
+# 2. Diccionario directo (Flask 1.1+) → serializa automáticamente a JSON
 #    return {"ok": True}, 201
+#    Flask internamente llama a jsonify() y establece Content-Type: application/json.
 
-# 3. Una tupla (cuerpo, código, headers)
+# 3. Tupla (cuerpo, código, headers) → control granular de la respuesta
 #    return {"ok": True}, 200, {"X-Custom-Header": "valor"}
 
-# 4. Un objeto Response completo con make_response()
+# 4. Objeto Response completo con make_response() → control total
+#    Necesario cuando se debe manipular cookies, headers especiales o Content-Type.
 
 @usuarios_bp.route("/descargar-csv")
 def descargar_csv():
+    """Genera un CSV en memoria y lo envía como archivo descargable.
+
+    make_response() es necesario aquí porque necesitamos modificar los headers
+    de la respuesta (Content-Disposition para forzar descarga, Content-Type
+    para indicar que es un CSV y no HTML).
+    """
     contenido_csv = "id,nombre,email\n1,Andres,andres@correo.com"
     response = make_response(contenido_csv)
     response.headers["Content-Disposition"] = "attachment; filename=usuarios.csv"
+    # Content-Disposition: attachment fuerza al navegador a descargar el archivo
+    # en lugar de renderizarlo en pantalla.
     response.headers["Content-Type"] = "text/csv"
     return response
 
 
-# ─── Ruteo Dinámico con Convertidores de Tipo ───
-# Flask permite extraer parámetros tipados de la URL usando convertidores:
+# ─────────────────────────────────────────────────────────────────────────────
+# REFERENCIA DIDÁCTICA: RUTEO DINÁMICO CON CONVERTIDORES DE TIPO
+# ─────────────────────────────────────────────────────────────────────────────
+# Flask permite extraer parámetros tipados de la URL usando convertidores.
+# El convertidor valida el tipo ANTES de que la función se ejecute.
+# Si la validación falla, Flask retorna automáticamente un 404 Not Found
+# (no un 400), porque considera que la URL no coincide con ninguna ruta registrada.
 
 @usuarios_bp.route("/productos/<int:producto_id>")
-def ver_producto(producto_id):
-    # <int:id> valida que producto_id sea de tipo int automáticamente
+def ver_producto(producto_id: int):
+    """<int:id> convierte y valida que producto_id sea un entero positivo."""
     return {"producto_id": producto_id}
 
 @usuarios_bp.route("/archivos/<path:ruta_archivo>")
-def ver_archivo(ruta_archivo):
-    # <path:ruta> acepta texto incluyendo barras '/'
+def ver_archivo(ruta_archivo: str):
+    """<path:ruta> acepta texto incluyendo barras '/' (a diferencia de <string>)."""
     return {"ruta": ruta_archivo}
 
 @usuarios_bp.route("/token/<uuid:user_token>")
 def ver_por_token(user_token):
-    # <uuid:token> valida que sea una cadena UUID válida
+    """<uuid:token> valida que sea una cadena UUID válida (RFC 4122)."""
     return {"token": str(user_token)}
 
-# Convertidores disponibles:
-#   <int:id>     → Entero positivo
-#   <float:val>  → Número decimal
-#   <string:nom> → String sin barras (por defecto)
-#   <path:ruta>  → String incluyendo barras
-#   <uuid:tok>   → Cadena UUID válida
+# ─── Convertidores Disponibles ───
+#   <int:id>     → Entero positivo. Rechaza negativos y decimales.
+#   <float:val>  → Número decimal (acepta punto, no coma).
+#   <string:nom> → String sin barras (por defecto si no se especifica convertidor).
+#   <path:ruta>  → String incluyendo barras. Útil para rutas de archivos.
+#   <uuid:tok>   → Cadena UUID válida. Convierte a objeto uuid.UUID internamente.
 
 
-# ─── url_for y redirect — Generador de URLs ───
-# url_for genera URLs dinámicamente usando el nombre del endpoint.
-# Esto evita hardcodear rutas (strings fijos) en el código.
+# ─────────────────────────────────────────────────────────────────────────────
+# REFERENCIA DIDÁCTICA: url_for Y redirect
+# ─────────────────────────────────────────────────────────────────────────────
+# url_for() genera URLs dinámicamente usando el nombre del endpoint.
+# Ventaja fundamental: si el url_prefix del Blueprint cambia de /api/v1 a /api/v2,
+# todas las URLs generadas con url_for() se actualizan automáticamente.
+# Hardcodear strings como "/api/v1/usuarios/perfil" rompe ante cualquier cambio.
 
 @usuarios_bp.route("/perfil")
 def perfil():
+    """Endpoint de ejemplo para demostrar url_for."""
     return {"pagina": "perfil"}
 
 @usuarios_bp.route("/ir-a-perfil")
 def ir_a_perfil():
+    """Redirige al endpoint 'perfil' usando url_for para generar la URL."""
     return redirect(url_for("usuarios.perfil"))
-    # "usuarios" = nombre del Blueprint, "perfil" = nombre de la función
+    # "usuarios.perfil" → "usuarios" es el nombre del Blueprint (primer argumento),
+    # "perfil" es el nombre de la función Python del endpoint.
+    # Si el endpoint requiere parámetros: url_for("usuarios.obtener_usuario", usuario_id=42)
 
 
-# ─── Cookies — Almacenamiento en el Cliente ───
-# Las cookies se almacenan en el navegador del cliente en texto plano.
+# ─────────────────────────────────────────────────────────────────────────────
+# REFERENCIA DIDÁCTICA: COOKIES Y SESIONES
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Cookies — Almacenamiento en el Cliente (Texto Plano) ────────────────────
+# Las cookies se almacenan en el navegador del cliente. Son visibles y modificables
+# por el usuario. NUNCA guardes datos sensibles en cookies sin cifrado.
 
 @usuarios_bp.route("/set-cookie")
 def set_cookie():
+    """Establece una cookie con directivas de seguridad."""
     response = make_response("Cookie guardada!")
     response.set_cookie(
         "preferencia_tema",
         "oscuro",
-        max_age=30 * 24 * 60 * 60,  # 30 días en segundos
-        httponly=True                # Protección XSS (JavaScript no puede leerla)
+        max_age=30 * 24 * 60 * 60,  # 30 días en segundos (tiempo de expiración)
+        httponly=True,               # Protección XSS: JavaScript no puede leer esta cookie
+        # secure=True,              # Descomentar en producción: solo se envía por HTTPS
+        # samesite="Lax",           # Protección CSRF: restringe el envío cross-site
     )
     return response
 
 @usuarios_bp.route("/get-cookie")
 def get_cookie():
+    """Lee una cookie del request. Retorna valor por defecto si no existe."""
     tema = request.cookies.get("preferencia_tema", "claro")
     return {"tema": tema}
 
 
-# ─── Sessions — Sesiones Firmadas Criptográficamente ───
-# Flask firma los datos de la sesión usando SECRET_KEY (definida en config.py).
+# ─── Sessions — Cookies Firmadas Criptográficamente ──────────────────────────
+# Flask firma los datos de la sesión usando SECRET_KEY (definida en config.py, Bloque 3).
 # Los datos se almacenan en una cookie firmada en el cliente.
-# El servidor valida su integridad (que no fue alterada).
-# ⚠️ NUNCA guardes contraseñas ni tokens sensibles aquí: los datos están
-# firmados pero NO encriptados (cualquiera puede leerlos, pero no modificarlos).
+# El servidor valida su integridad (que no fue alterada) en cada petición.
+#
+# ⚠️ ADVERTENCIA DE SEGURIDAD:
+# Los datos están FIRMADOS pero NO ENCRIPTADOS. Cualquiera puede decodificar
+# el contenido (es Base64), pero no puede modificarlo sin invalidar la firma.
+# NUNCA guardes contraseñas, tokens ni datos sensibles en la sesión.
+#
+# Para sesiones server-side (datos en Redis/BD), usar Flask-Session:
+#   pip install Flask-Session
+#   app.config["SESSION_TYPE"] = "redis"
 
 @usuarios_bp.route("/login")
 def login():
+    """Almacena datos del usuario en la sesión firmada."""
     session["usuario_id"] = 42
     session["rol"] = "Administrador"
     return {"mensaje": "Sesión iniciada."}
 
 @usuarios_bp.route("/dashboard")
 def dashboard():
+    """Verifica que exista una sesión activa antes de permitir acceso."""
     if "usuario_id" not in session:
-        abort(401)  # Lanza un error 401 No Autorizado
+        abort(401)
+        # abort(n) lanza una HTTPException que el handler del Bloque 7
+        # (handle_http_exception) intercepta y responde con JSON.
+        # Para APIs, se prefiere raise NoAutenticadoError() del Bloque 7
+        # por consistencia semántica, pero abort() es válido para rutas didácticas.
     return {"bienvenido": f"Usuario ID: {session['usuario_id']}"}
 
 @usuarios_bp.route("/logout")
 def logout():
-    session.clear()  # Limpia todos los datos de la sesión
+    """Destruye todos los datos de la sesión actual."""
+    session.clear()  # Limpia todos los datos de la cookie de sesión
     return {"mensaje": "Sesión cerrada."}
 
 
@@ -1474,76 +1614,142 @@ def logout():
 # 📄 ARCHIVO: app/__init__.py
 # ─────────────────────────────────────────────────────────────────────────────
 # En lugar de crear 'app' como variable global (como en el Hola Mundo del Bloque 1),
-# usamos una función fábrica (Factory Pattern). Esto resuelve dos problemas:
-#   1. Importaciones circulares: los módulos pueden importar 'db' sin importar 'app'.
-#   2. Testing: podemos crear múltiples instancias con configuraciones distintas.
+# usamos una función fábrica (Factory Pattern). Esto resuelve dos problemas críticos:
+#
+#   1. Importaciones Circulares:
+#      Si 'app' fuera global, models.py necesitaría importar 'app' para obtener 'db',
+#      y routes.py importaría 'app' para registrar rutas. Pero app/__init__.py también
+#      importa models y routes → dependencia circular → ImportError.
+#      Con Factory Pattern, los módulos importan 'db' (instancia huérfana) y la función
+#      create_app() los vincula en tiempo de ejecución, rompiendo el ciclo.
+#
+#   2. Testing Aislado:
+#      Con una variable global, todos los tests comparten la misma instancia de app.
+#      Con create_app(), cada suite de tests puede crear su propia instancia con
+#      configuración independiente (BD en memoria, DEBUG=True, etc.).
+#
+# 💡 Patrón de Inicialización Perezosa (Lazy Initialization):
+# Las extensiones (SQLAlchemy, Migrate) se instancian FUERA de create_app()
+# como objetos "huérfanos" sin app asociada. Esto permite que cualquier módulo
+# los importe (ej: from app import db) sin depender de que la app exista.
+# Dentro de create_app(), init_app() los vincula a la instancia concreta.
 
 import os
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 
-# Instancias de extensiones (sin inicializar — patrón de inicialización perezosa)
-db = SQLAlchemy()
-migrate = Migrate()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# INSTANCIAS DE EXTENSIONES (Inicialización Perezosa)
+# ─────────────────────────────────────────────────────────────────────────────
+
+db = SQLAlchemy()
+# SQLAlchemy() sin argumentos crea una instancia "huérfana". No sabe a qué app
+# pertenece ni qué base de datos usar. Esta instancia es la que importan los
+# modelos del Bloque 4: `from app import db` → `class MiModelo(db.Model)`.
+# La conexión real se establece cuando create_app() ejecuta db.init_app(app).
+
+migrate = Migrate()
+# Flask-Migrate envuelve Alembic (herramienta de migraciones de SQLAlchemy).
+# Permite gestionar cambios incrementales del esquema de BD de forma segura,
+# con historial y capacidad de rollback (ver comandos al final de este bloque).
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# APPLICATION FACTORY
+# ─────────────────────────────────────────────────────────────────────────────
 
 def create_app() -> Flask:
     """Application Factory Pattern optimizado para producción (2026).
 
     Lee dinámicamente la configuración del entorno del sistema operativo,
     inicializa las extensiones de forma perezosa y registra los componentes.
+
+    Este patrón es el estándar oficial recomendado por la documentación de Flask
+    para aplicaciones que requieren testing, despliegue multi-entorno o escalabilidad.
     """
     app = Flask(__name__)
+    # Flask(__name__) crea la instancia de la aplicación. __name__ le indica a Flask
+    # el paquete raíz para localizar templates/ y static/ relativos al módulo.
 
-    # 1. Carga dinámica de configuración (12-Factor App: Principio 3)
+    # ── 1. Carga Dinámica de Configuración (12-Factor App: Principio 3) ──
+    # La configuración se lee del sistema operativo, no del código fuente.
     # Por defecto apunta a ProductionConfig para garantizar seguridad ("fail-secure"):
-    # si alguien olvida configurar la variable, la app arranca en modo estricto.
+    # si alguien olvida configurar la variable, la app arranca en modo estricto
+    # con _require_env() que exige todas las variables críticas (Bloque 3).
     env_config = os.getenv("FLASK_CONFIG", "app.core.config.ProductionConfig")
     app.config.from_object(env_config)
+    # from_object() acepta un string con la ruta completa de la clase Python
+    # (ej: "app.core.config.DevelopmentConfig"). Flask importa el módulo dinámicamente
+    # y copia todos los atributos en MAYÚSCULAS al diccionario app.config.
 
-    # 2. Inicializar extensiones de forma segura
+    # ── 2. Inicializar Extensiones (Vinculación Perezosa) ──
     db.init_app(app)
-    migrate.init_app(app, db)  # Flask-Migrate gestiona migraciones con Alembic
+    # init_app() vincula la instancia de SQLAlchemy a esta app específica.
+    # Internamente, lee app.config["SQLALCHEMY_DATABASE_URI"] para saber a qué
+    # motor de BD conectarse. Si la URI es inválida, el error aparece aquí.
 
-    # 3. Habilitar CORS (Cross-Origin Resource Sharing)
-    # Necesario cuando un frontend (React, Vue, Angular) consume la API desde otro dominio.
-    # Sin esto, el navegador bloquea las peticiones por la política de mismo origen.
+    migrate.init_app(app, db)
+    # Vincula Flask-Migrate (Alembic) a esta app y a la instancia de SQLAlchemy.
+    # Habilita los comandos `flask db` para gestionar migraciones.
+
+    # ── 3. Habilitar CORS (Cross-Origin Resource Sharing) ──
+    # CORS es un mecanismo de seguridad del navegador que bloquea peticiones HTTP
+    # desde un dominio distinto al del servidor (Política de Mismo Origen).
+    # Si el frontend (React en localhost:3000) llama a la API (Flask en localhost:5000),
+    # el navegador bloqueará la petición porque los puertos son distintos.
+    # Sin CORS configurado, la API funciona desde Postman o curl (no son navegadores),
+    # pero falla silenciosamente desde cualquier frontend web.
     from flask_cors import CORS
     CORS(app, resources={r"/api/*": {"origins": os.getenv("ALLOWED_ORIGINS", "*")}})
-    # En producción, reemplaza "*" por los dominios permitidos:
-    # ALLOWED_ORIGINS=https://miapp.com,https://admin.miapp.com
+    # resources={r"/api/*": ...}: CORS solo aplica a rutas bajo /api/, no a todo el servidor.
+    #
+    # ⚠️ ADVERTENCIA DE SEGURIDAD:
+    # origins="*" permite peticiones desde CUALQUIER dominio. Esto es aceptable en
+    # desarrollo, pero en producción debe restringirse a los dominios del frontend:
+    #   ALLOWED_ORIGINS=https://miapp.com,https://admin.miapp.com
+    # Un atacante podría crear un sitio malicioso que haga peticiones a tu API
+    # usando las cookies del usuario si CORS está abierto.
 
-    # 4. Registro diferido de Blueprints (previene importaciones circulares)
+    # ── 4. Registro Diferido de Blueprints ──
+    # Los imports se hacen DENTRO de create_app() (no al inicio del archivo)
+    # para prevenir importaciones circulares. En el momento de estos imports,
+    # 'db' ya está inicializado y los modelos pueden ser cargados sin error.
     from app.modulos.usuarios.routes import usuarios_bp
     from app.errors.handlers import errors_bp
 
     app.register_blueprint(usuarios_bp)
+    # Registra las rutas CRUD del Bloque 8 bajo /api/v1/usuarios/.
+
     app.register_blueprint(errors_bp)
+    # Registra los handlers globales del Bloque 7. Al usar app_errorhandler(),
+    # estos capturan excepciones de CUALQUIER Blueprint, no solo del suyo.
 
     # ❌ SE ELIMINA: with app.app_context(): db.create_all()
-    # Las tablas se gestionan profesionalmente con migraciones (Flask-Migrate/Alembic)
+    # Las tablas se gestionan profesionalmente con migraciones (Flask-Migrate/Alembic).
+    # Ver justificación detallada más abajo.
 
     return app
 
-# ─── ¿Qué hace cada línea? ───
-# Flask(__name__)                       → Crea la instancia de la app.
-# os.getenv("FLASK_CONFIG", ...)        → Lee la clase de configuración de la variable de entorno.
-# app.config.from_object(env_config)    → Carga la configuración del Bloque 3 dinámicamente.
-# db.init_app(app)                      → Conecta SQLAlchemy a esta app específica.
-# migrate.init_app(app, db)             → Conecta Flask-Migrate (Alembic) para migraciones de BD.
-# CORS(app, resources={...})            → Habilita peticiones cross-origin para rutas /api/*.
-# app.register_blueprint(bp)            → Registra las rutas del Bloque 8.
 
-# ─── ⚠️ ¿Por qué NO usamos db.create_all()? ───
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ ¿POR QUÉ NO USAMOS db.create_all()? (Antipatrón de Producción)
+# ─────────────────────────────────────────────────────────────────────────────
 # Usar db.create_all() dentro del Factory es un antipatrón peligroso en producción:
-#   1. No gestiona cambios incrementales: si modificas un modelo, create_all() NO altera
-#      columnas existentes, solo crea tablas nuevas. Perderás cambios de esquema silenciosamente.
-#   2. Condiciones de carrera: en despliegues con múltiples contenedores Docker,
-#      cada instancia competiría por crear tablas simultáneamente, causando bloqueos en la BD.
-#   3. Sin historial: no hay registro de qué cambios se aplicaron ni capacidad de rollback.
 #
-# En su lugar, Flask-Migrate (basado en Alembic) gestiona migraciones de forma segura:
+#   1. No gestiona cambios incrementales: si modificas un modelo (ej: añadir columna),
+#      create_all() NO altera columnas existentes, solo crea tablas nuevas.
+#      Perderás cambios de esquema silenciosamente.
+#
+#   2. Condiciones de carrera: en despliegues con múltiples contenedores Docker,
+#      cada instancia competiría por crear tablas simultáneamente, causando
+#      bloqueos y deadlocks en la BD.
+#
+#   3. Sin historial: no hay registro de qué cambios se aplicaron ni capacidad
+#      de rollback. Si una migración rompe la BD, no hay vuelta atrás.
+#
+# Flask-Migrate (basado en Alembic) gestiona migraciones de forma segura:
 #   flask db init              → Inicializa el directorio de migraciones (solo una vez).
 #   flask db migrate -m "msg"  → Genera un archivo de migración con los cambios detectados.
 #   flask db upgrade           → Aplica las migraciones pendientes a la base de datos.
@@ -1554,6 +1760,9 @@ def create_app() -> Flask:
 # 📄 ARCHIVO: run.py
 # ─────────────────────────────────────────────────────────────────────────────
 # Punto de entrada de la aplicación. Este archivo va en la raíz del proyecto.
+# Su única responsabilidad es instanciar la app y, en desarrollo local,
+# levantar el servidor Werkzeug.
+#
 # ⚠️ El servidor Werkzeug (app.run()) NO es apto para producción:
 #   - Maneja un solo proceso y un solo hilo por defecto.
 #   - No gestiona reinicios automáticos ante fallos.
@@ -1563,15 +1772,33 @@ import os
 from dotenv import load_dotenv
 from app import create_app
 
-# Carga las variables de entorno desde un archivo .env local si existe (solo desarrollo)
+# ─── Carga de Variables de Entorno ───
 load_dotenv()
+# load_dotenv() lee el archivo .env del directorio raíz del proyecto y "eleva"
+# sus variables al sistema operativo ANTES de que create_app() se ejecute.
+# Una vez en el sistema, os.environ.get() (usado en config.py, Bloque 3) las encuentra.
+#
+# ⚠️ IMPORTANTE: load_dotenv() NO sobrescribe variables del sistema operativo que
+# ya existen. Si DB_SERVER ya está definida en el SO, el archivo .env la ignora.
+# Esto garantiza que las variables de producción (inyectadas por Docker, Kubernetes
+# o el proveedor cloud) siempre tienen prioridad sobre el .env de desarrollo.
+#
+# Recomendación: .env solo en desarrollo. En producción, usar variables del propio
+# sistema de alojamiento (AWS Secrets Manager, Azure Key Vault, Docker secrets).
 
-# Instancia global requerida por servidores WSGI como Gunicorn (ej: 'gunicorn run:app')
+# ─── Instancia Global ───
 app = create_app()
+# Esta variable global 'app' es requerida por servidores WSGI como Gunicorn.
+# Gunicorn busca el objeto app en el módulo especificado:
+#   gunicorn "run:app" --workers 4 --bind 0.0.0.0:8000
+# El string "run:app" significa: "importa 'run.py' y usa su atributo 'app'".
 
 if __name__ == "__main__":
-    # Extraemos variables con valores de contingencia seguros para desarrollo local
+    # Este bloque solo se ejecuta con `python run.py`, NO con Gunicorn.
+    # Extraemos variables con valores de contingencia seguros para desarrollo local.
     host = os.getenv("FLASK_RUN_HOST", "127.0.0.1")
+    # 127.0.0.1 (localhost): solo acepta conexiones locales. Usar 0.0.0.0 para
+    # aceptar conexiones externas (ej: desde otro dispositivo en la red).
     port = int(os.getenv("FLASK_RUN_PORT", "5000"))
     debug = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t")
 
@@ -1585,97 +1812,199 @@ if __name__ == "__main__":
 # En producción, se delega a servidores WSGI robustos como Gunicorn (Linux/Docker):
 #   gunicorn "run:app" --workers 4 --bind 0.0.0.0:8000
 #
-# 💡 ¿Por qué usamos '--workers 4'? (El problema del GIL)
-# Debido al GIL (Global Interpreter Lock) de Python, un proceso solo puede ejecutar un
-# hilo de código a la vez. Gunicorn sortea esta limitación levantando 4 procesos
-# del sistema operativo totalmente independientes (cada uno con su propio GIL).
+# 💡 ¿Por qué '--workers 4'? (El problema del GIL)
+# Debido al GIL (Global Interpreter Lock) de Python, un proceso solo puede ejecutar
+# un hilo de código Python a la vez. Gunicorn sortea esta limitación levantando
+# 4 procesos del sistema operativo totalmente independientes (cada uno con su propio
+# GIL y su propia copia del intérprete Python).
 # Esto permite que tu servidor procese 4 peticiones en paralelo real.
+# Fórmula recomendada: workers = (2 × núcleos_CPU) + 1
 #
-# O con Waitress (compatible con Windows):
+# O con Waitress (compatible con Windows — no requiere compilación C):
 #   waitress-serve --port=8000 --call app:create_app
 
 
 # =================================================================================================================
-#         ▀▄▀▄▀▄⡷⠂ BLOQUE 10: LOGGING Y OBSERVABILIDAD ⠐⢾▀▄▀▄▀▄
+#              ▀▄▀▄▀▄⡷⠂ BLOQUE 10: LOGGING Y OBSERVABILIDAD ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 ARCHIVO: app/core/logging_config.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Sin logs, estás volando a ciegas en producción. Usar print() es un antipatrón
-# porque no es thread-safe, carece de niveles de severidad y no rota archivos.
-# Aquí configuramos el módulo estándar 'logging' de Python para generar logs
-# profesionales, rotativos y formateados.
+# Sin logs, estás volando a ciegas en producción. Un bug que no deja rastro
+# es un bug que no se puede diagnosticar.
+#
+# 💡 ¿Por qué print() es un antipatrón en producción?
+#   1. No es thread-safe: en un servidor multi-hilo (Gunicorn con threads),
+#      múltiples print() concurrentes pueden intercalar líneas, produciendo
+#      logs ilegibles e imposibles de parsear.
+#   2. Sin niveles de severidad: no puedes distinguir un mensaje informativo
+#      de un error crítico. En producción, necesitas filtrar por severidad
+#      para alertas automáticas (ej: solo enviar alerta Slack si nivel >= ERROR).
+#   3. Sin rotación: print() escribe a stdout sin límite. Si rediriges a un
+#      archivo, crecerá indefinidamente hasta llenar el disco del servidor.
+#   4. Sin formato estandarizado: herramientas de observabilidad (Datadog, ELK,
+#      CloudWatch) necesitan logs con formato parseable (timestamp, nivel, módulo).
+#
+# El módulo estándar 'logging' de Python resuelve todos estos problemas.
 
 import os
 import logging
 from logging.handlers import RotatingFileHandler
 
-def configure_logging(app):
-    """Configura el sistema de logging para la aplicación Flask."""
-    
-    # 1. Definir formato del log
-    # El formato JSON estructurado es ideal para herramientas como ELK o Datadog.
-    # Aquí usaremos un formato de texto robusto para legibilidad humana.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURACIÓN CENTRALIZADA DE LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def configure_logging(app) -> None:
+    """Configura el sistema de logging para la aplicación Flask.
+
+    Se invoca dentro de create_app() (Bloque 9) para que los logs estén
+    disponibles desde el primer momento de vida de la aplicación.
+
+    Integración con el Factory Pattern:
+      def create_app() -> Flask:
+          app = Flask(__name__)
+          ...
+          configure_logging(app)   # ← Se llama aquí
+          return app
+    """
+
+    # ── 1. Formato del Log ──
+    # Cada línea de log incluye: timestamp, severidad, módulo origen y mensaje.
+    # Este formato de texto es legible para humanos y parseable por herramientas
+    # de observabilidad básicas. Para producción avanzada, considerar JSON
+    # estructurado (ver referencia al final del bloque).
     log_format = logging.Formatter(
         '[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
     )
-    
-    # 2. Handler para Archivo con Rotación
-    # Evita que el archivo log llene el disco. Mantiene 10 archivos de 5MB máx.
+    # Componentes del formato:
+    #   %(asctime)s   → Timestamp ISO 8601 (ej: 2026-06-12 14:30:05,123)
+    #   %(levelname)s → Nivel de severidad (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    #   %(module)s    → Nombre del módulo Python que emitió el log
+    #   %(message)s   → El mensaje de log en sí
+
+    # ── 2. Handler para Archivo con Rotación Automática ──
+    # RotatingFileHandler evita que el archivo de log llene el disco del servidor.
+    # Cuando el archivo alcanza maxBytes, se renombra a app.log.1 y se crea uno nuevo.
+    # Los archivos más antiguos se eliminan cuando se supera backupCount.
     if not os.path.exists('logs'):
         os.mkdir('logs')
-        
+
     file_handler = RotatingFileHandler(
-        'logs/app.log', maxBytes=5242880, backupCount=10
+        'logs/app.log',
+        maxBytes=5_242_880,  # 5 MB por archivo (5 × 1024 × 1024 bytes)
+        backupCount=10       # Mantiene hasta 10 archivos rotados (50 MB total máximo)
     )
     file_handler.setFormatter(log_format)
-    
-    # 3. Handler para Consola (stdout)
+    file_handler.setLevel(logging.INFO)
+    # El handler de archivo filtra DEBUG para no saturar el disco con mensajes
+    # de bajo nivel. Solo INFO y superiores se persisten en el archivo.
+
+    # ── 3. Handler para Consola (stdout) ──
+    # Los logs en consola son esenciales para desarrollo local y para contenedores
+    # Docker, donde stdout es el mecanismo estándar de recolección de logs
+    # (Docker logs, Kubernetes pod logs, CloudWatch Logs).
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(log_format)
-    
-    # 4. Asignar handlers y niveles
+
+    # ── 4. Asignar Handlers y Nivel Global ──
     app.logger.addHandler(file_handler)
     app.logger.addHandler(console_handler)
-    
+
+    # El nivel global determina el umbral mínimo de severidad que se procesa.
+    # Mensajes por debajo del nivel configurado se descartan silenciosamente.
     if app.config.get('DEBUG'):
         app.logger.setLevel(logging.DEBUG)
+        # DEBUG: todos los mensajes pasan. Ideal para desarrollo.
     else:
         app.logger.setLevel(logging.INFO)
-        
-    app.logger.info('Iniciando sistema de logging de la aplicación.')
+        # INFO: filtra DEBUG. Reduce el volumen de logs en producción.
 
-# 💡 ¿Cómo usarlo en tus servicios o rutas?
-# from flask import current_app
-# current_app.logger.info("Usuario creado: %s", email)
-# current_app.logger.error("Error conectando a DB: %s", str(e))
+    app.logger.info('Sistema de logging inicializado correctamente.')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 REFERENCIA: NIVELES DE SEVERIDAD DE LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+# | Nivel    | Valor | Cuándo usarlo                                         |
+# | :---     | :---  | :---                                                  |
+# | DEBUG    | 10    | Detalles internos para diagnóstico durante desarrollo  |
+# | INFO     | 20    | Eventos normales del sistema (inicio, usuario creado)  |
+# | WARNING  | 30    | Situación inesperada que NO detiene la operación       |
+# | ERROR    | 40    | Fallo que impide completar una operación específica    |
+# | CRITICAL | 50    | Fallo total del sistema (BD caída, sin memoria)        |
+#
+# Ejemplos de uso en servicios y rutas:
+#   from flask import current_app
+#
+#   current_app.logger.debug("Consultando empleado ID=%s", empleado_id)
+#   current_app.logger.info("Usuario creado exitosamente: %s", email)
+#   current_app.logger.warning("Intento de acceso sin token desde IP: %s", ip)
+#   current_app.logger.error("Error conectando a BD: %s", str(e))
+#   current_app.logger.critical("Sin memoria disponible para procesar la petición")
+#
+# ⚠️ NOTA SOBRE FORMATO:
+# Usamos logger.info("mensaje: %s", variable) en lugar de f-strings
+# (logger.info(f"mensaje: {variable}")) porque el módulo logging evalúa
+# el formato SOLO si el nivel está activo. Con f-strings, Python construye
+# el string SIEMPRE, incluso si el nivel está desactivado — desperdiciando CPU.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 REFERENCIA: current_app.logger VS logging.getLogger()
+# ─────────────────────────────────────────────────────────────────────────────
+# - current_app.logger: el logger oficial de Flask. Hereda los handlers y el
+#   nivel configurados en configure_logging(). Disponible solo dentro de un
+#   request context o app context activo. Es el recomendado para código Flask.
+#
+# - logging.getLogger(__name__): el logger estándar de Python. Útil para módulos
+#   que se ejecutan fuera del contexto de Flask (ej: tareas de Celery, scripts
+#   de migración, utilidades standalone). Requiere configuración manual de handlers.
+#
+# Regla general: dentro de Flask → current_app.logger.
+#               fuera de Flask  → logging.getLogger(__name__).
 
 
 # =================================================================================================================
-#         ▀▄▀▄▀▄⡷⠂ BLOQUE 11: TESTING PROFESIONAL CON PYTEST ⠐⢾▀▄▀▄▀▄
+#              ▀▄▀▄▀▄⡷⠂ BLOQUE 11: TESTING PROFESIONAL CON PYTEST ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 
-# Probar aplicaciones Flask garantiza la estabilidad del código ante futuros cambios.
-# Pytest es el estándar de testing en Python gracias a su sintaxis simple basada en fixtures.
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 📄 ARCHIVO: tests/conftest.py + tests/test_usuarios.py
+# ─────────────────────────────────────────────────────────────────────────────
+# Probar aplicaciones Flask garantiza la estabilidad del código ante futuros
+# cambios. Sin tests, cada deploy es una apuesta. Pytest es el estándar de
+# testing en Python gracias a su sintaxis simple basada en fixtures.
+#
+# 💡 Pirámide de Testing (Concepto Clave):
+# La proporción ideal de tests en una aplicación profesional es:
+#   Base:  Tests unitarios    (muchos, rápidos, aislados — testean funciones/services)
+#   Medio: Tests integración  (moderados — testean la API completa con BD)
+#   Punta: Tests E2E          (pocos, lentos — testean el flujo completo con frontend)
+#
+# En este bloque nos enfocamos en tests de INTEGRACIÓN: simulamos peticiones HTTP
+# reales contra la API con una BD en memoria (SQLite), verificando que todos los
+# componentes (routes → schemas → services → models) funcionen coordinados.
+#
 # ─── ¿Qué es una Fixture? ───
-# Una fixture es una función que prepara y devuelve los recursos necesarios para un test.
-# Pytest las inyecta automáticamente como argumentos de las funciones de test
-# por coincidencia de nombre del parámetro.
-
-# ─── Scope de las Fixtures ───
-# scope="session"  → Se ejecuta UNA vez para toda la suite de tests.
-# scope="function" → Se ejecuta una vez POR CADA función de test (por defecto).
+# Una fixture es una función decorada con @pytest.fixture que prepara y devuelve
+# los recursos necesarios para un test. Pytest las inyecta automáticamente como
+# argumentos de las funciones de test por coincidencia de nombre del parámetro.
+#
+# ─── Scope de las Fixtures (Ciclo de Vida) ───
+# scope="session"  → Se ejecuta UNA vez para toda la suite de tests. Compartida.
 # scope="module"   → Se ejecuta una vez por archivo de test.
+# scope="function" → Se ejecuta una vez POR CADA función de test (por defecto).
 # autouse=True     → Se aplica automáticamente a cada test sin necesidad de inyectarla.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 ARCHIVO: tests/conftest.py
 # ─────────────────────────────────────────────────────────────────────────────
-# conftest.py es un archivo especial que Pytest escanea automáticamente.
-# Las fixtures definidas aquí están disponibles para TODOS los archivos de test.
+# conftest.py es un archivo especial que Pytest escanea automáticamente al inicio.
+# Las fixtures definidas aquí están disponibles para TODOS los archivos de test
+# del mismo directorio y subdirectorios, sin necesidad de importarlas.
 
 import os
 import pytest
@@ -1683,84 +2012,133 @@ from app import create_app, db as _db
 from app.modulos.usuarios.models import DepartamentoModel
 
 
-# ─── Fixture: Aplicación Flask para Testing ───
+# ─────────────────────────────────────────────────────────────────────────────
+# FIXTURE: APLICACIÓN FLASK PARA TESTING
+# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture(scope="session")
 def app():
-    """Crea la app inyectando la configuración de test mediante variable de entorno.
+    """Crea una instancia de la app con configuración de testing.
 
-    Nuestro create_app() lee os.getenv("FLASK_CONFIG"). En lugar de pasarle
-    un string como parámetro (lo cual rompe la firma de la función), manipulamos
-    la variable de entorno ANTES de inicializar la aplicación.
+    scope='session': la app se crea una sola vez para toda la suite de tests.
+    Crear la app es costoso (importar módulos, configurar extensiones), así que
+    reutilizamos la misma instancia. La BD se crea aquí y se destruye al final.
+
+    Inyección de configuración:
+    Nuestro create_app() (Bloque 9) lee os.getenv("FLASK_CONFIG"). En lugar de
+    modificar la firma de la función (lo cual acoplaría el código de producción
+    al de testing), manipulamos la variable de entorno ANTES de inicializar.
     """
+    # Forzamos DevelopmentConfig para evitar que _require_env() de ProductionConfig
+    # (Bloque 3) exija variables de producción que no existen en el entorno de tests.
     os.environ["FLASK_CONFIG"] = "app.core.config.DevelopmentConfig"
 
     app = create_app()
     app.config["TESTING"] = True
+    # TESTING=True modifica el comportamiento de Flask:
+    #   - Propaga excepciones al test en lugar de retornar HTTP 500.
+    #   - Desactiva el manejo de errores para facilitar la depuración.
+
     app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///:memory:"
+    # BD en memoria: ultra rápida, sin archivos en disco, desaparece al cerrar.
+    # Ideal para tests porque cada suite arranca con una BD limpia.
 
     # db.create_all() es válido SOLO en el contexto de testing con BD en memoria.
-    # En producción, las migraciones se manejan de forma estricta con Flask-Migrate.
+    # En producción, las migraciones se manejan estrictamente con Flask-Migrate (Bloque 9).
     with app.app_context():
         _db.create_all()
         yield app
+        # yield convierte la fixture en un generador: todo lo anterior a yield es SETUP,
+        # todo lo posterior es TEARDOWN. Pytest garantiza que el teardown se ejecuta
+        # incluso si los tests fallan con excepciones.
         _db.drop_all()
 
     # Limpiamos la variable de entorno al finalizar la suite
     os.environ.pop("FLASK_CONFIG", None)
 
 
-# ─── Fixture: Aislamiento Transaccional por Test ───
+# ─────────────────────────────────────────────────────────────────────────────
+# FIXTURE: AISLAMIENTO TRANSACCIONAL POR TEST
+# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)
 def db_session(app):
     """Orquesta una conexión transaccional externa que envuelve cada test.
 
+    autouse=True: se aplica automáticamente a CADA test sin necesidad de
+    declarar 'db_session' como parámetro. Garantiza que todos los tests
+    están aislados transaccionalmente sin excepción.
+
+    💡 ¿Por qué no usar simplemente db.session.rollback() al final?
+    Nuestros servicios (Bloque 5) ejecutan `with db.session.begin():` internamente,
+    que hace COMMIT real. Un rollback() posterior no deshace un commit ya ejecutado.
+
     💡 ¿Por qué no usar begin_nested() directamente?
-    Nuestros servicios ejecutan `with db.session.begin():` internamente.
     Si la fixture abriera una transacción con begin_nested(), el servicio intentaría
-    abrir una transacción principal encima, causando un error de estado inválido.
+    abrir una transacción principal encima, causando InvalidRequestError.
 
     Este patrón conecta la sesión de SQLAlchemy a una transacción externa controlada
     por la fixture. Las transacciones internas del servicio operan como SAVEPOINTS
     anidados dentro de esta transacción padre, que se revierte al finalizar el test.
+
+    Resultado: cada test ve datos limpios, como si la BD se recreara cada vez,
+    pero sin el coste de recrear tablas (que es lento).
     """
     with app.app_context():
         connection = _db.engine.connect()
         transaction = connection.begin()
 
-        # Vinculamos la sesión de SQLAlchemy a esta conexión transaccional
+        # Vinculamos la sesión de SQLAlchemy a esta conexión transaccional.
+        # Todas las operaciones ORM pasan por esta conexión controlada.
         _db.session.configure(bind=connection)
 
         yield _db.session
 
-        # Revertimos TODA la transacción padre (incluidos los SAVEPOINTS internos)
+        # TEARDOWN: revertimos TODA la transacción padre.
+        # Esto deshace todos los INSERT, UPDATE y DELETE realizados durante el test,
+        # incluidos los que pasaron por db.session.begin() (convertidos en SAVEPOINTS).
         transaction.rollback()
         connection.close()
         _db.session.remove()
 
 
-# ─── Fixture: Datos Iniciales (Seed Data) ───
+# ─────────────────────────────────────────────────────────────────────────────
+# FIXTURE: DATOS INICIALES (Seed Data)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def depto_test(db_session):
-    """Crea los datos mínimos necesarios dejando que la BD asigne la Identidad.
+    """Crea un departamento de prueba dejando que la BD asigne el ID.
 
     💡 ¿Por qué no forzar id=1?
-    En motores como SQL Server forzar IDs en columnas autoincrementales falla por defecto.
-    Usamos .flush() para que SQLite genere el ID identity y lo inyectamos dinámicamente.
+    En motores como SQL Server, forzar IDs en columnas IDENTITY falla por defecto
+    (requiere SET IDENTITY_INSERT ON). Usamos .flush() para que el motor genere
+    el ID identity y lo inyectamos dinámicamente en los tests.
+
+    flush() vs commit():
+      - flush(): ejecuta el INSERT en la BD (genera el ID) pero NO cierra la
+        transacción. Los datos son visibles dentro de la sesión actual.
+      - commit(): ejecuta flush() + cierra la transacción. Aquí no lo usamos
+        porque la transacción la controla la fixture db_session.
     """
     depto = DepartamentoModel(nombre="Ingeniería")
     db_session.add(depto)
-    db_session.flush()  # Persiste en la transacción actual y genera el depto.id sin hacer commit
+    db_session.flush()  # Persiste y genera depto.id sin hacer commit
     return depto
 
 
-# ─── Fixture: Cliente HTTP Virtual ───
+# ─────────────────────────────────────────────────────────────────────────────
+# FIXTURE: CLIENTE HTTP VIRTUAL
+# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def client(app):
-    """Crea el cliente virtual para simular peticiones HTTP sin levantar un servidor."""
+    """Crea el cliente virtual para simular peticiones HTTP sin levantar un servidor.
+
+    app.test_client() retorna un objeto que simula un navegador:
+    soporta .get(), .post(), .put(), .delete() con JSON, headers y cookies.
+    Las peticiones se procesan internamente por Flask sin socket TCP real.
+    """
     return app.test_client()
 
 
@@ -1768,37 +2146,56 @@ def client(app):
 # 📄 ARCHIVO: tests/test_usuarios.py
 # ─────────────────────────────────────────────────────────────────────────────
 # Los tests son funciones que comienzan con 'test_'.
-# Las fixtures se inyectan por coincidencia de nombre (ej: el parámetro 'client'
-# corresponde a la fixture 'client' definida en conftest.py).
+# Las fixtures se inyectan por coincidencia de nombre: el parámetro 'client'
+# corresponde a la fixture 'client' definida en conftest.py.
+#
+# Cada test sigue el patrón AAA (Arrange-Act-Assert):
+#   Arrange → Preparar datos de entrada (payload, fixtures)
+#   Act     → Ejecutar la acción (petición HTTP)
+#   Assert  → Verificar el resultado esperado
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TESTS: CREACIÓN DE USUARIOS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def test_crear_usuario_exito(client, depto_test):
     """Prueba que un usuario se crea correctamente con datos válidos."""
+    # Arrange
     payload = {
         "nombre": "Andrés",
         "email": "andres@correo.com",
-        "departamento_id": depto_test.id  # Utiliza el ID dinámico generado por la semilla
+        "departamento_id": depto_test.id  # ID dinámico generado por la fixture
     }
+
+    # Act
     response = client.post("/api/v1/usuarios/", json=payload)
 
+    # Assert
     assert response.status_code == 201
     data = response.get_json()
     assert data["nombre"] == "Andrés"
     assert data["email"] == "andres@correo.com"
     assert "id" in data
-    # Verifica que el departamento anidado se serializa correctamente (joinedload + Pydantic)
+    # Verifica que el departamento anidado se serializa correctamente
+    # (requiere joinedload en services.py, Bloque 5 + schema anidado, Bloque 6)
     assert data["departamento"]["nombre"] == "Ingeniería"
 
 
 def test_crear_usuario_email_invalido(client, depto_test):
-    """Prueba que un email inválido retorna error 400 estructurado por el handler global."""
+    """Prueba que un email inválido retorna error 422 estructurado por el handler global."""
+    # Arrange
     payload = {
-        "nombre": "An",
-        "email": "esto-no-es-email",
+        "nombre": "An",               # Demasiado corto (min_length=3 en NombreEmpleado, Bloque 6)
+        "email": "esto-no-es-email",   # Formato inválido (EmailStr de Pydantic)
         "departamento_id": depto_test.id
     }
+
+    # Act
     response = client.post("/api/v1/usuarios/", json=payload)
 
-    assert response.status_code == 400
+    # Assert — HTTP 422: el handler de PydanticValidationError (Bloque 7) retorna 422
+    assert response.status_code == 422
     data = response.get_json()
     assert data["error"] == "ValidacionError"
     assert "detalles" in data
@@ -1806,36 +2203,52 @@ def test_crear_usuario_email_invalido(client, depto_test):
 
 def test_crear_usuario_body_vacio(client):
     """Prueba que un body vacío retorna errores de campos obligatorios faltantes."""
+    # Act
     response = client.post("/api/v1/usuarios/", json={})
 
-    assert response.status_code == 400
+    # Assert — Los campos nombre, email y departamento_id son obligatorios (Bloque 6)
+    assert response.status_code == 422
     data = response.get_json()
     assert data["error"] == "ValidacionError"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TESTS: CONSULTA Y ERRORES
+# ─────────────────────────────────────────────────────────────────────────────
+
 def test_obtener_usuario_inexistente(client):
-    """Prueba que buscar un ID que no existe retorna 404 con estructura de error."""
+    """Prueba que buscar un ID inexistente retorna 404 con estructura de error."""
+    # Act
     response = client.get("/api/v1/usuarios/99999")
 
+    # Assert — RecursoNoEncontradoError del Bloque 7 retorna 404
     assert response.status_code == 404
     data = response.get_json()
     assert data["status"] == "error"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TESTS: CICLO CRUD COMPLETO
+# ─────────────────────────────────────────────────────────────────────────────
+
 def test_ciclo_completo_crud(client, depto_test):
-    """Prueba el flujo completo en aislamiento transaccional: Crear → Leer → Actualizar → Eliminar."""
-    # 1. Crear
+    """Prueba el flujo completo en aislamiento transaccional: Crear → Leer → Actualizar → Eliminar.
+
+    Gracias a la fixture db_session (autouse=True), todos los datos creados en este
+    test se revierten al finalizar — no afectan a los demás tests.
+    """
+    # ── 1. Crear (POST) ──
     payload = {"nombre": "María", "email": "maria@correo.com", "departamento_id": depto_test.id}
     create_res = client.post("/api/v1/usuarios/", json=payload)
     assert create_res.status_code == 201
     usuario_id = create_res.get_json()["id"]
 
-    # 2. Leer
+    # ── 2. Leer (GET) ──
     get_res = client.get(f"/api/v1/usuarios/{usuario_id}")
     assert get_res.status_code == 200
     assert get_res.get_json()["nombre"] == "María"
 
-    # 3. Actualizar
+    # ── 3. Actualizar (PUT) ──
     update_res = client.put(
         f"/api/v1/usuarios/{usuario_id}",
         json={"nombre": "María Actualizada"}
@@ -1843,19 +2256,26 @@ def test_ciclo_completo_crud(client, depto_test):
     assert update_res.status_code == 200
     assert update_res.get_json()["nombre"] == "María Actualizada"
 
-    # 4. Eliminar
+    # ── 4. Eliminar (DELETE) ──
     delete_res = client.delete(f"/api/v1/usuarios/{usuario_id}")
     assert delete_res.status_code == 204
 
-    # 5. Verificar que ya no existe
+    # ── 5. Verificar que ya no existe ──
     verify_res = client.get(f"/api/v1/usuarios/{usuario_id}")
     assert verify_res.status_code == 404
 
 
-# ─── Tests Complementarios Didácticos (Cookies & Sessions) ───
+# ─────────────────────────────────────────────────────────────────────────────
+# TESTS COMPLEMENTARIOS: COOKIES Y SESIONES
+# ─────────────────────────────────────────────────────────────────────────────
 
 def test_login_y_dashboard_con_sesion(client):
-    """Prueba el comportamiento de las sesiones firmadas usando session_transaction()."""
+    """Prueba el comportamiento de las sesiones firmadas usando session_transaction().
+
+    session_transaction() permite manipular la cookie de sesión directamente
+    desde el test, sin necesidad de pasar por el endpoint /login. Esto aísla
+    el test: si /login tiene un bug, este test no se ve afectado.
+    """
     # Intentar acceder al dashboard sin sesión activa debe lanzar 401
     res_bloqueado = client.get("/api/v1/usuarios/dashboard")
     assert res_bloqueado.status_code == 401
@@ -1874,80 +2294,178 @@ def test_login_y_dashboard_con_sesion(client):
 def test_verificar_guardado_de_cookies(client):
     """Prueba que las cookies de respuesta incluyan las directivas de seguridad (HttpOnly)."""
     response = client.get("/api/v1/usuarios/set-cookie")
-    
+
+    # Verificamos que la cookie se estableció con los valores y flags correctos
     assert "preferencia_tema" in response.headers["Set-Cookie"]
     assert "oscuro" in response.headers["Set-Cookie"]
     assert "HttpOnly" in response.headers["Set-Cookie"]
 
 
-# ─── 🏆 ¿Por qué nuestra aplicación es 100% Testeable? ───
-# La arquitectura que hemos construido en este documento es la clave para un testing robusto:
-# 1. Factory Pattern (Bloque 9): Al no tener una variable 'app' global, podemos instanciar apps aisladas.
-# 2. Configuración por Entorno (Bloque 3): Permite inyectar una BD en memoria sin cambiar código.
-# 3. Servicios Delgados (Bloque 5): La lógica de negocio no depende de Flask (ni request ni response).
-# 4. Aislamiento Transaccional: Usar db_session con SAVEPOINTS anidados garantiza que los tests no choquen.
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 ¿POR QUÉ NUESTRA APLICACIÓN ES 100% TESTEABLE?
+# ─────────────────────────────────────────────────────────────────────────────
+# La arquitectura construida a lo largo de este documento es la clave:
+#
+#   1. Factory Pattern (Bloque 9): al no tener una variable 'app' global, podemos
+#      instanciar apps aisladas con configuraciones distintas para cada suite.
+#
+#   2. Configuración por Entorno (Bloque 3): permite inyectar una BD en memoria
+#      (SQLite) sin cambiar una línea del código de producción.
+#
+#   3. Servicios Delgados (Bloque 5): la lógica de negocio no depende de Flask
+#      (ni request ni response). Se puede testear unitariamente sin HTTP.
+#
+#   4. Aislamiento Transaccional: la fixture db_session con SAVEPOINTS anidados
+#      garantiza que los tests no choquen entre sí ni contaminen la BD.
 
 # ─── Ejecutar los Tests ───
-# En la terminal, ejecuta pytest para correr las pruebas:
-#
-# pytest                    → Ejecuta todos los tests en el directorio
+# pytest                    → Ejecuta todos los tests del directorio
 # pytest tests/             → Ejecuta tests de la carpeta "tests"
 # pytest -v                 → Modo verboso (detalle de cada test)
 # pytest -k "crear"         → Solo tests que contengan "crear" en el nombre
-# pytest --tb=short         → Tracebacks reducidos (errores más cortos)
+# pytest --tb=short         → Tracebacks reducidos (errores más compactos)
+# pytest -x                 → Se detiene en el primer test que falle
 
 
 # =================================================================================================================
-#         ▀▄▀▄▀▄⡷⠂ BLOQUE 12: HASHING Y SEGURIDAD DE CONTRASEÑAS ⠐⢾▀▄▀▄▀▄
+#              ▀▄▀▄▀▄⡷⠂ BLOQUE 12: HASHING Y SEGURIDAD DE CONTRASEÑAS ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 ARCHIVO: app/core/security.py
 # ─────────────────────────────────────────────────────────────────────────────
 # NUNCA guardes contraseñas en texto plano. Si la base de datos es comprometida,
-# los atacantes tendrán acceso a las cuentas de los usuarios.
-# Flask provee werkzeug.security para manejar esto fácilmente, aunque en
-# producción estricta se prefiere 'bcrypt' o 'argon2'.
+# los atacantes tendrán acceso a las cuentas de los usuarios en segundos.
+#
+# 💡 ¿Qué es el Hashing? (Irreversibilidad)
+# Un hash es una función matemática de un solo sentido: convierte un texto
+# (ej: "MiContraseña123") en una cadena de caracteres de longitud fija
+# (ej: "pbkdf2:sha256:600000$salt$abc123..."). El proceso es IRREVERSIBLE:
+# no existe operación matemática para recuperar la contraseña original a partir
+# del hash. La única forma de "verificar" es hashear el intento del usuario
+# y comparar ambos hashes.
+#
+# 💡 ¿Qué es un Salt? (Protección contra Rainbow Tables)
+# Un salt es una cadena aleatoria única que se genera para cada contraseña
+# ANTES de hashearla. Dos usuarios con la misma contraseña ("123456")
+# producirán hashes DIFERENTES porque cada uno tiene su propio salt.
+# Sin salt, un atacante podría usar tablas pre-calculadas (Rainbow Tables)
+# para buscar el hash y encontrar la contraseña original en segundos.
+# Con salt, las tablas pre-calculadas son inútiles porque cada hash es único.
+#
+# Werkzeug genera el salt automáticamente — no necesitas gestionarlo manualmente.
 
 from werkzeug.security import generate_password_hash, check_password_hash
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCIONES DE HASHING
+# ─────────────────────────────────────────────────────────────────────────────
+
 def hash_password(password: str) -> str:
-    """
-    Convierte una contraseña en un hash irreversible usando pbkdf2:sha256.
-    Incluye un 'salt' aleatorio automático para prevenir ataques de Rainbow Tables.
+    """Convierte una contraseña en un hash irreversible con salt aleatorio.
+
+    Internamente usa PBKDF2-SHA256 (Password-Based Key Derivation Function 2)
+    con 600,000 iteraciones (valor por defecto de Werkzeug 2023+).
+    Las iteraciones ralentizan intencionalmente el cómputo para que un ataque
+    de fuerza bruta sea computacionalmente inviable (~0.3s por intento vs ~0.000001s
+    para un hash simple como MD5).
+
+    El resultado tiene el formato: 'method$salt$hash'
+    Ejemplo: 'pbkdf2:sha256:600000$abc123$def456...'
     """
     return generate_password_hash(password)
 
+
 def verify_password(password: str, hashed_password: str) -> bool:
-    """Verifica si la contraseña ingresada coincide con el hash almacenado."""
+    """Verifica si la contraseña ingresada coincide con el hash almacenado.
+
+    Internamente extrae el salt del hash almacenado, aplica el mismo algoritmo
+    a la contraseña candidata y compara de forma segura contra timing attacks.
+
+    NOTA DE SEGURIDAD — Timing Attacks:
+    check_password_hash() usa internamente hmac.compare_digest() para comparar
+    los hashes en tiempo constante. Una comparación con '==' revelaría información
+    al atacante: si el primer byte no coincide, '==' retorna False inmediatamente
+    (más rápido). El atacante podría medir la diferencia de tiempo y deducir
+    cuántos bytes del hash son correctos, reduciendo el espacio de búsqueda.
+    hmac.compare_digest() siempre tarda lo mismo, independientemente de cuántos
+    bytes coincidan.
+    """
     return check_password_hash(hashed_password, password)
 
-# 💡 Actualización del Modelo de Usuario (Bloque 4):
-# En lugar de tener un campo `password`, el modelo debe tener `password_hash`.
-# 
-# class UsuarioModel(db.Model):
-#     ...
-#     password_hash = db.Column(db.String(255), nullable=False)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 INTEGRACIÓN CON EL MODELO ORM (Bloque 4)
+# ─────────────────────────────────────────────────────────────────────────────
+# En lugar de un campo 'password' en texto plano, el modelo debe almacenar
+# 'password_hash'. Los métodos de instancia encapsulan la lógica de seguridad:
 #
-#     def set_password(self, password):
+# class UsuarioModel(db.Model):
+#     __tablename__ = "usuarios"
+#     ...
+#     password_hash: Mapped[str] = mapped_column(String(255))
+#     # String(255) porque los hashes PBKDF2 de Werkzeug ocupan ~160 caracteres.
+#     # 255 deja margen si se migra a bcrypt o argon2 (hashes más largos).
+#
+#     def set_password(self, password: str) -> None:
+#         """Hashea y almacena la contraseña. NUNCA almacena texto plano."""
 #         self.password_hash = hash_password(password)
 #
-#     def check_password(self, password):
+#     def check_password(self, password: str) -> bool:
+#         """Compara una contraseña candidata contra el hash almacenado."""
 #         return verify_password(password, self.password_hash)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 REFERENCIA: ALGORITMOS DE HASHING (PBKDF2 vs bcrypt vs argon2)
+# ─────────────────────────────────────────────────────────────────────────────
+# | Algoritmo     | Ventaja                          | Cuándo usarlo               |
+# | :---          | :---                             | :---                        |
+# | PBKDF2-SHA256 | Incluido en Werkzeug (0 deps)    | Apps Flask estándar         |
+# | bcrypt        | Resistente a GPU (memory-hard)   | Producción con alto riesgo  |
+# | argon2id      | Ganador de PHC (2015), óptimo    | Máxima seguridad disponible |
+#
+# PBKDF2 es suficiente para la mayoría de aplicaciones. Para producción con
+# requisitos de seguridad elevados (fintech, salud), considerar bcrypt o argon2:
+#   pip install bcrypt
+#   generate_password_hash(password, method="bcrypt")
 
 
 # =================================================================================================================
-#         ▀▄▀▄▀▄⡷⠂ BLOQUE 13: JWT, REFRESH TOKENS Y AUTENTICACIÓN ⠐⢾▀▄▀▄▀▄
+#              ▀▄▀▄▀▄⡷⠂ BLOQUE 13: JWT, REFRESH TOKENS Y AUTENTICACIÓN ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 ARCHIVO: app/auth/routes.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Las cookies de sesión no escalan bien en arquitecturas de microservicios o apps móviles.
-# La solución moderna es usar JSON Web Tokens (JWT).
-# Un JWT es un token criptográficamente firmado que contiene la identidad del usuario.
-# 
+# Las cookies de sesión del Bloque 8 no escalan bien en arquitecturas modernas:
+#   - Microservicios: cada servicio necesitaría acceso al almacén de sesiones.
+#   - Apps móviles: las cookies nativas son limitadas y frágiles en iOS/Android.
+#   - SPAs (React/Vue): las cookies cross-origin requieren configuración compleja.
+#
+# La solución moderna es JSON Web Tokens (JWT): tokens firmados criptográficamente
+# que contienen la identidad del usuario y viajan en el header Authorization.
+#
+# 💡 Estructura de un JWT (tres partes separadas por puntos):
+#   Header.Payload.Signature
+#
+#   - Header:    {"alg": "HS256", "typ": "JWT"} → Algoritmo de firma usado.
+#   - Payload:   {"sub": "1", "rol": "admin", "exp": 1718200000} → Datos del usuario.
+#                No guardar datos sensibles aquí: el Payload es Base64, NO cifrado.
+#   - Signature: HMAC-SHA256(Header + Payload, SECRET_KEY) → Firma de integridad.
+#                El servidor usa SECRET_KEY (Bloque 3) para verificar que el token
+#                no fue alterado. Si alguien modifica el Payload, la firma no coincide.
+#
 # Instalación: pip install Flask-JWT-Extended
+#
+# 💡 Integración con el Factory Pattern (Bloque 9):
+# Flask-JWT-Extended se inicializa en create_app():
+#   from flask_jwt_extended import JWTManager
+#   jwt = JWTManager()
+#   jwt.init_app(app)
+#   app.config["JWT_SECRET_KEY"] = app.config["SECRET_KEY"]
+#   app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(minutes=15)
+#   app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=30)
 
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import (
@@ -1958,34 +2476,83 @@ from flask_jwt_extended import (
     get_jwt
 )
 from app.core.security import verify_password
+from app.errors.exceptions import NoAutenticadoError
 # from app.modulos.usuarios.models import UsuarioModel
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEFINICIÓN DEL BLUEPRINT DE AUTENTICACIÓN
+# ─────────────────────────────────────────────────────────────────────────────
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/v1/auth")
 
-# Lista negra en memoria (En producción: usar Redis)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BLOCKLIST — INVALIDACIÓN DE TOKENS
+# ─────────────────────────────────────────────────────────────────────────────
+# Los JWT son stateless: una vez emitidos, son válidos hasta que expiran.
+# Para implementar logout (invalidación anticipada), necesitamos una lista
+# negra (blocklist) donde registramos los tokens invalidados.
+#
+# ⚠️ ADVERTENCIA DE PRODUCCIÓN:
+# Esta implementación usa un set() en memoria. Si el servidor se reinicia,
+# la blocklist se pierde y los tokens "invalidados" vuelven a ser válidos.
+# En producción, usar Redis con TTL (Time To Live) automático:
+#   import redis
+#   blocklist_store = redis.Redis(host="localhost", port=6379, db=1)
+#   blocklist_store.setex(jti, timedelta(minutes=15), "revoked")
+
 BLOCKLIST = set()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: LOGIN — Emisión de Tokens
+# ─────────────────────────────────────────────────────────────────────────────
 
 @auth_bp.route("/login", methods=["POST"])
 def login():
-    """Autentica al usuario y emite Access y Refresh tokens."""
+    """Autentica al usuario y emite un par Access Token + Refresh Token.
+
+    Flujo de autenticación:
+      1. El cliente envía email + contraseña en el body JSON.
+      2. El servidor busca al usuario en la BD por email.
+      3. Verifica la contraseña contra el hash almacenado (Bloque 12).
+      4. Si es válido, emite dos tokens:
+         - Access Token  (vida corta: ~15 min): se envía en cada petición protegida.
+         - Refresh Token (vida larga: ~30 días): solo sirve para obtener nuevos Access Tokens.
+      5. El cliente almacena ambos tokens y usa el Access en el header Authorization.
+
+    El par Access/Refresh evita que el usuario tenga que re-ingresar su contraseña
+    cada 15 minutos, mientras minimiza el riesgo si el Access Token es robado
+    (expira rápidamente).
+    """
     datos = request.get_json()
     email = datos.get("email")
     password = datos.get("password")
 
-    # 1. Buscar usuario (simulado)
-    # usuario = UsuarioModel.query.filter_by(email=email).first()
+    # 1. Buscar usuario en la BD (simulado para esta documentación)
+    # En producción, descomentar:
+    # usuario = db.session.scalars(
+    #     select(UsuarioModel).filter_by(email=email)
+    # ).first()
     usuario = {"id": 1, "email": "admin@empresa.com", "rol": "admin", "password_hash": "..."}
 
-    # 2. Verificar contraseña
+    # 2. Verificar credenciales
     # if not usuario or not usuario.check_password(password):
-    #     return jsonify({"error": "Credenciales inválidas"}), 401
-    
+    #     raise NoAutenticadoError("Credenciales inválidas.")
+    # Usamos NoAutenticadoError (Bloque 7) para que el handler global responda
+    # con JSON estructurado consistente, en lugar de jsonify() manual.
+
     # 3. Crear Tokens
-    # Access Token: Vida corta (ej: 15 minutos). Se envía en cada petición.
-    # Refresh Token: Vida larga (ej: 30 días). Solo sirve para pedir nuevos Access Tokens.
     identity = str(usuario["id"])
-    claims_adicionales = {"rol": usuario["rol"]} # Datos extra en el payload del JWT
-    
+    # identity es el identificador único del usuario dentro del JWT.
+    # Usamos str() porque JWT serializa a JSON, donde los tipos deben ser homogéneos.
+
+    claims_adicionales = {"rol": usuario["rol"]}
+    # additional_claims inyecta datos extra en el Payload del JWT.
+    # Estos claims son accesibles con get_jwt() en cualquier endpoint protegido.
+    # ⚠️ No guardar datos sensibles: el Payload es Base64 (legible por cualquiera).
+
     access_token = create_access_token(identity=identity, additional_claims=claims_adicionales)
     refresh_token = create_refresh_token(identity=identity)
 
@@ -1994,240 +2561,644 @@ def login():
         "refresh_token": refresh_token
     }), 200
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: REFRESH — Renovación de Access Token
+# ─────────────────────────────────────────────────────────────────────────────
+
 @auth_bp.route("/refresh", methods=["POST"])
-@jwt_required(refresh=True) # Exige un REFRESH token válido, no un access token
+@jwt_required(refresh=True)
 def refresh():
-    """Emite un nuevo Access Token usando un Refresh Token válido."""
+    """Emite un nuevo Access Token usando un Refresh Token válido.
+
+    @jwt_required(refresh=True): exige un REFRESH token (no un access token).
+    Si el cliente envía un access token aquí, Flask-JWT-Extended lo rechaza
+    con un error 422 (tipo de token incorrecto).
+
+    Caso de uso: el frontend detecta que el Access Token expiró (error 401),
+    automáticamente envía el Refresh Token a este endpoint, obtiene un nuevo
+    Access Token y reintenta la petición original — transparente para el usuario.
+    """
     identity = get_jwt_identity()
-    # Aquí se podría verificar en BD si el usuario sigue activo
+    # get_jwt_identity() extrae el 'sub' (subject) del JWT decodificado,
+    # que corresponde al identity que pasamos en create_access_token().
+
+    # Aquí se podría verificar en la BD si el usuario sigue activo:
+    # usuario = db.session.get(UsuarioModel, int(identity))
+    # if not usuario or not usuario.activo:
+    #     raise NoAutenticadoError("La cuenta ha sido desactivada.")
+
     nuevo_access_token = create_access_token(identity=identity)
     return jsonify({"access_token": nuevo_access_token}), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: LOGOUT — Invalidación de Token
+# ─────────────────────────────────────────────────────────────────────────────
 
 @auth_bp.route("/logout", methods=["POST"])
 @jwt_required()
 def logout():
-    """Invalida el token actual añadiéndolo a la Blocklist."""
-    jti = get_jwt()["jti"] # Identificador único del JWT
+    """Invalida el Access Token actual añadiéndolo a la Blocklist.
+
+    get_jwt()["jti"] obtiene el JTI (JWT ID): un identificador único UUID
+    generado automáticamente por Flask-JWT-Extended para cada token emitido.
+    Al añadirlo a la blocklist, el callback @jwt.token_in_blocklist_loader
+    lo rechazará en futuras peticiones.
+    """
+    jti = get_jwt()["jti"]
     BLOCKLIST.add(jti)
-    return jsonify({"mensaje": "Sesión cerrada exitosamente"}), 200
+    return jsonify({"mensaje": "Sesión cerrada exitosamente."}), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 REFERENCIA: CONFIGURACIÓN DEL CALLBACK DE BLOCKLIST
+# ─────────────────────────────────────────────────────────────────────────────
+# Este callback se registra en create_app() (Bloque 9) para que Flask-JWT-Extended
+# verifique la blocklist en cada petición protegida:
+#
+# @jwt.token_in_blocklist_loader
+# def check_if_token_revoked(jwt_header, jwt_payload):
+#     jti = jwt_payload["jti"]
+#     return jti in BLOCKLIST  # True = token revocado → acceso denegado
+#
+# Con Redis en producción:
+#     return blocklist_store.get(jti) is not None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 REFERENCIA: ALMACENAMIENTO SEGURO DE TOKENS EN EL FRONTEND
+# ─────────────────────────────────────────────────────────────────────────────
+# | Almacenamiento     | Riesgo         | Recomendación                        |
+# | :---               | :---           | :---                                 |
+# | localStorage       | Vulnerable XSS | ❌ No recomendado para tokens        |
+# | sessionStorage     | Vulnerable XSS | ❌ No recomendado para tokens        |
+# | Cookie HttpOnly    | Seguro XSS     | ✅ Recomendado (CSRF requiere CORS)  |
+# | Memoria (variable) | Seguro XSS     | ✅ Ideal para SPAs (se pierde al cerrar) |
+#
+# El enfoque más seguro es almacenar el token en una cookie HttpOnly+Secure+SameSite,
+# que JavaScript no puede leer (protección XSS). Flask-JWT-Extended soporta esto:
+#   app.config["JWT_TOKEN_LOCATION"] = ["cookies"]
+#   app.config["JWT_COOKIE_SECURE"] = True    # Solo HTTPS
+#   app.config["JWT_COOKIE_SAMESITE"] = "Lax" # Protección CSRF
 
 
 # =================================================================================================================
-#         ▀▄▀▄▀▄⡷⠂ BLOQUE 14: ROLES, PERMISOS Y DECORADORES ⠐⢾▀▄▀▄▀▄
+#              ▀▄▀▄▀▄⡷⠂ BLOQUE 14: ROLES, PERMISOS Y DECORADORES ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 ARCHIVO: app/auth/decorators.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Autenticación = ¿Quién eres? (Login)
-# Autorización = ¿Qué puedes hacer? (Roles y Permisos)
+# Autenticación = ¿Quién eres? (Login → Bloque 13)
+# Autorización  = ¿Qué puedes hacer? (Roles y Permisos → este bloque)
 #
-# Construiremos un decorador personalizado para proteger rutas según el rol.
+# Construiremos un decorador personalizado que protege rutas según el rol
+# del usuario almacenado en los claims del JWT.
+#
+# 💡 ¿Qué es un Decorador? (Contexto Técnico)
+# Un decorador es una función que envuelve a otra función para añadir
+# comportamiento antes o después de su ejecución, sin modificar su código.
+# En este caso, verificamos el rol del usuario ANTES de ejecutar el endpoint.
+# Si el rol no es válido, la petición se rechaza sin llegar al controlador.
+#
+# 💡 ¿Por qué functools.wraps?
+# Sin @wraps(fn), la función decorada pierde su nombre (__name__) y docstring
+# (__doc__) originales, reemplazados por los del wrapper interno. Esto rompe:
+#   - Flask: url_for() usa __name__ para resolver endpoints. Sin @wraps,
+#     dos endpoints decorados tendrían el mismo __name__ ("decorator") → conflicto.
+#   - Debugging: los tracebacks mostrarían "decorator" en lugar del nombre real.
+#   - Documentación automática (Swagger/OpenAPI): perdería los docstrings originales.
 
 from functools import wraps
-from flask import jsonify
 from flask_jwt_extended import verify_jwt_in_request, get_jwt
+from app.errors.exceptions import NoAutorizadoError
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DECORADOR DE AUTORIZACIÓN POR ROLES
+# ─────────────────────────────────────────────────────────────────────────────
 
 def roles_required(*roles_permitidos):
-    """
-    Decorador que verifica si el JWT tiene un rol permitido.
-    Debe usarse DESPUÉS de @app.route.
+    """Decorador que verifica si el JWT tiene un rol permitido.
+
+    Patrón de tres funciones anidadas (Closure):
+      roles_required("admin", "superadmin")  ← Recibe los roles (configuración)
+      └── wrapper(fn)                        ← Recibe la función a decorar
+          └── decorator(*args, **kwargs)     ← Se ejecuta en cada petición
+
+    Debe usarse DESPUÉS de @app.route (los decoradores se aplican de abajo hacia arriba):
+      @app.route("/ruta")          ← Se registra primero (más externo)
+      @roles_required("admin")     ← Se ejecuta antes del endpoint (más interno)
+      def mi_endpoint(): ...
     """
     def wrapper(fn):
         @wraps(fn)
         def decorator(*args, **kwargs):
             # 1. Verificar que haya un JWT válido en la petición
+            # verify_jwt_in_request() busca el token en el header Authorization
+            # (formato: "Bearer eyJ..."). Si no existe o está expirado, lanza
+            # una excepción que Flask-JWT-Extended maneja automáticamente (401).
             verify_jwt_in_request()
-            
+
             # 2. Extraer los claims (payload) del JWT
             claims = get_jwt()
             rol_usuario = claims.get("rol", "guest")
-            
+            # Si el JWT no contiene claim "rol", asumimos "guest" (mínimos privilegios).
+
             # 3. Validar autorización
             if rol_usuario not in roles_permitidos:
-                return jsonify({
-                    "error": "Acceso denegado", 
-                    "detalle": f"Requiere uno de estos roles: {roles_permitidos}"
-                }), 403
-                
+                # Usamos NoAutorizadoError del Bloque 7 para mantener consistencia
+                # con el sistema centralizado de errores. El handler global
+                # (handle_app_error) responde con JSON estructurado y código 403.
+                raise NoAutorizadoError(
+                    f"Acceso denegado. Se requiere uno de estos roles: "
+                    f"{', '.join(roles_permitidos)}. Rol actual: '{rol_usuario}'."
+                )
+
             return fn(*args, **kwargs)
         return decorator
     return wrapper
 
-# 💡 Ejemplo de Uso en routes.py:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 EJEMPLO DE USO EN routes.py (Bloque 8)
+# ─────────────────────────────────────────────────────────────────────────────
+# Los decoradores se apilan: primero @route registra la URL, luego
+# @roles_required verifica permisos antes de ejecutar la función.
 #
-# @app.route("/api/v1/usuarios/<id>", methods=["DELETE"])
+# @usuarios_bp.route("/<int:usuario_id>", methods=["DELETE"])
 # @roles_required("admin", "superadmin")
-# def eliminar_usuario(id):
+# def eliminar_usuario(usuario_id: int):
+#     """Solo administradores pueden eliminar usuarios."""
 #     ...
+#
+# @usuarios_bp.route("/reportes/financiero")
+# @roles_required("admin", "contador")
+# def reporte_financiero():
+#     """Accesible solo para roles administrativos y contables."""
+#     ...
+#
+# @usuarios_bp.route("/mi-perfil")
+# @roles_required("admin", "usuario", "guest")
+# def mi_perfil():
+#     """Cualquier rol autenticado puede ver su propio perfil."""
+#     ...
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 REFERENCIA: RBAC vs ABAC (Modelos de Autorización)
+# ─────────────────────────────────────────────────────────────────────────────
+# RBAC (Role-Based Access Control) — Usado en este bloque:
+#   Los permisos se asignan por ROL ("admin puede borrar, usuario puede leer").
+#   Simple, escalable y suficiente para la mayoría de aplicaciones CRUD.
+#
+# ABAC (Attribute-Based Access Control) — Para reglas complejas:
+#   Los permisos se evalúan por ATRIBUTOS del contexto ("un usuario puede editar
+#   solo sus propios recursos" o "solo si la petición viene de la red interna").
+#   Requiere un motor de políticas (ej: Casbin, OPA) y es más costoso de mantener.
+#
+# Recomendación: empezar con RBAC. Migrar a ABAC solo si las reglas de negocio
+# requieren granularidad que los roles no pueden expresar.
 
 
 # =================================================================================================================
-#         ▀▄▀▄▀▄⡷⠂ BLOQUE 15: MIDDLEWARE Y HOOKS DEL CICLO DE VIDA ⠐⢾▀▄▀▄▀▄
+#              ▀▄▀▄▀▄⡷⠂ BLOQUE 15: MIDDLEWARE Y HOOKS DEL CICLO DE VIDA ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 ARCHIVO: app/middleware.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Flask permite interceptar el ciclo de vida de una petición HTTP.
-# Existen dos enfoques: Hooks (dentro de Flask) y Middleware WSGI (fuera de Flask).
+# Flask permite interceptar el ciclo de vida de una petición HTTP en dos niveles:
+#   1. Hooks Nativos de Flask: funciones que se ejecutan antes/después de cada
+#      request. Tienen acceso completo al contexto de Flask (request, g, current_app).
+#   2. Middleware WSGI: clases que envuelven la app a nivel de protocolo WSGI,
+#      ANTES de que Flask procese la petición. No tienen acceso al contexto de Flask.
+#
+# 💡 Ciclo de Vida Completo de una Petición (con Hooks):
+#   Cliente → Servidor WSGI (Gunicorn) → Middleware WSGI → Flask
+#     → before_request (Hook) → Route/Controller → after_request (Hook) → Respuesta
+#     → teardown_appcontext (Hook — SIEMPRE, incluso si hubo error)
+#
+# ⚠️ CUÁNDO USAR CADA ENFOQUE:
+#   - Hooks Flask: cuando necesitas acceder a request, session, current_app o g.
+#     Ejemplos: logging, inyección de usuario en 'g', headers de seguridad.
+#   - Middleware WSGI: cuando la operación debe ocurrir ANTES de que Flask exista.
+#     Ejemplos: redirección HTTP→HTTPS, filtrado de IPs, compresión gzip.
+#
+# Integración con el Factory Pattern (Bloque 9):
+#   def create_app() -> Flask:
+#       app = Flask(__name__)
+#       ...
+#       registrar_hooks(app)                                    # ← Hooks Flask
+#       app.wsgi_app = ForzarHTTPSMiddleware(app.wsgi_app)     # ← Middleware WSGI
+#       return app
 
-# 1. Hooks Nativos de Flask
-# Tienen acceso completo al contexto (request, g, current_app).
-def registrar_hooks(app):
-    
+from flask import request
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. HOOKS NATIVOS DE FLASK
+# ─────────────────────────────────────────────────────────────────────────────
+
+def registrar_hooks(app) -> None:
+    """Registra los hooks del ciclo de vida de la petición HTTP.
+
+    Se invoca dentro de create_app() para vincular los hooks a la app específica.
+    """
+
     @app.before_request
     def log_peticion():
-        """Se ejecuta ANTES de que la petición llegue al controlador (routes.py)."""
-        # Útil para: Rate limiting manual, cargar usuario en 'g', validar cabeceras.
-        app.logger.debug("Nueva petición a: %s", request.path)
-        
+        """Se ejecuta ANTES de que la petición llegue al controlador (routes.py).
+
+        Casos de uso reales:
+          - Registrar logs de acceso para auditoría.
+          - Cargar datos del usuario autenticado en el objeto 'g'.
+          - Rate limiting manual (aunque se recomienda Flask-Limiter, Bloque 16).
+          - Validar headers obligatorios (ej: API keys, Content-Type).
+
+        Si esta función retorna una respuesta (ej: return jsonify({...}), 403),
+        la petición se ABORTA y el controlador NUNCA se ejecuta.
+        Si retorna None (implícito), la petición continúa al controlador.
+        """
+        app.logger.debug("Petición entrante: %s %s", request.method, request.path)
+        # El objeto 'g' (flask.g) es un almacén temporal por petición.
+        # Útil para compartir datos entre before_request y el controlador:
+        #   from flask import g
+        #   g.usuario_actual = obtener_usuario_del_token()
+        #   # En el controlador: current_user = g.usuario_actual
+
     @app.after_request
     def inyectar_headers_seguridad(response):
-        """Se ejecuta DESPUÉS del controlador, antes de enviar la respuesta al cliente."""
-        # Útil para: Añadir CORS, CSP, HSTS, o modificar el payload de salida.
+        """Se ejecuta DESPUÉS del controlador, antes de enviar la respuesta al cliente.
+
+        Casos de uso reales:
+          - Inyectar headers de seguridad (HSTS, CSP, X-Content-Type-Options).
+          - Añadir headers CORS personalizados.
+          - Modificar o filtrar el cuerpo de la respuesta.
+          - Registrar métricas de tiempo de respuesta.
+
+        IMPORTANTE: DEBE retornar el objeto response. Si no lo retorna,
+        Flask lanza un error interno y el cliente recibe un 500.
+        """
+        # ── Headers de Seguridad Recomendados ──
         response.headers['X-Content-Type-Options'] = 'nosniff'
+        # Previene que el navegador "adivine" el Content-Type del archivo.
+        # Sin esto, un archivo malicioso subido como .txt podría ser ejecutado como .html.
+
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+        # HSTS (HTTP Strict Transport Security): indica al navegador que SIEMPRE
+        # use HTTPS para este dominio durante los próximos 365 días (31536000 segundos).
+        # includeSubDomains extiende la política a todos los subdominios.
+
+        # response.headers['Content-Security-Policy'] = "default-src 'self'"
+        # CSP: restringe los orígenes desde los cuales el navegador puede cargar recursos.
+        # Descomentar y configurar según los recursos externos que use tu frontend.
+
         return response
-        
+
     @app.teardown_appcontext
     def limpieza(exception):
-        """Se ejecuta SIEMPRE al final, incluso si hubo un error 500 no capturado."""
-        # Útil para: Cerrar conexiones a base de datos o limpiar recursos temporales.
+        """Se ejecuta SIEMPRE al final, incluso si hubo un error 500 no capturado.
+
+        Parámetro 'exception': contiene la excepción si hubo un error, None si no.
+        Es el lugar seguro para liberar recursos que DEBEN cerrarse sin importar qué:
+          - Cerrar conexiones a servicios externos (APIs, caches).
+          - Limpiar archivos temporales generados durante la petición.
+          - Registrar métricas finales de rendimiento.
+
+        NOTA: la conexión a la BD de SQLAlchemy se cierra automáticamente por
+        Flask-SQLAlchemy al final de cada request. No es necesario hacerlo aquí.
+        """
         pass
 
-# 2. Middleware WSGI
-# Opera a un nivel más bajo. Intercepta la petición antes de que Flask siquiera despierte.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. MIDDLEWARE WSGI — INTERCEPTOR DE BAJO NIVEL
+# ─────────────────────────────────────────────────────────────────────────────
+# Opera a un nivel más bajo que Flask. Intercepta la petición antes de que
+# Flask siquiera despierte. Útil para operaciones que no necesitan el contexto
+# de Flask (request, session, g no existen aquí).
+
 class ForzarHTTPSMiddleware:
-    """Redirige tráfico HTTP a HTTPS."""
+    """Redirige tráfico HTTP a HTTPS a nivel WSGI.
+
+    ¿Por qué no usar before_request?
+    Un hook before_request ya está dentro de Flask, lo que significa que la
+    petición HTTP insegura ya llegó al framework. Con middleware WSGI,
+    la redirección ocurre ANTES de que Flask procese absolutamente nada —
+    máxima eficiencia y mínima superficie de ataque.
+    """
+
     def __init__(self, wsgi_app):
         self.wsgi_app = wsgi_app
+        # Almacenamos la app WSGI original para delegarle las peticiones HTTPS válidas.
 
-    def __call__(self, environ, start_response):
-        # environ es un diccionario crudo del servidor web (Gunicorn)
+    def __call__(self, environ: dict, start_response):
+        """Punto de entrada WSGI. Se ejecuta en cada petición al servidor.
+
+        Parámetros WSGI (estándar PEP 3333):
+          environ: diccionario crudo con TODA la información de la petición HTTP.
+                   Contiene headers, método, path, query string, etc.
+                   No es un objeto Flask — es un dict estándar Python.
+          start_response: callback para enviar el status y los headers de respuesta.
+        """
+        # HTTP_X_FORWARDED_PROTO: header inyectado por proxies reversos (Nginx, ALB, CloudFront).
+        # Indica el protocolo ORIGINAL que usó el cliente. Necesario porque la conexión
+        # entre el proxy y la app suele ser HTTP interno (el proxy termina el TLS).
+        # Sin este header, la app no sabría si el cliente original usó HTTPS o HTTP.
         if environ.get('HTTP_X_FORWARDED_PROTO', 'http') == 'http':
-            # Si es HTTP, respondemos con una redirección 301 a nivel WSGI
             url = f"https://{environ.get('HTTP_HOST', '')}{environ.get('PATH_INFO', '')}"
             start_response('301 Moved Permanently', [('Location', url)])
             return [b""]
-            
-        # Si es HTTPS, pasamos la petición a Flask
-        return self.wsgi_app(environ, start_response)
+            # Retornamos body vacío (bytes) porque el navegador seguirá
+            # automáticamente la redirección 301 a la URL HTTPS.
 
-# 💡 Integración en __init__.py:
-# app.wsgi_app = ForzarHTTPSMiddleware(app.wsgi_app)
+        # Si es HTTPS, delegamos la petición completa a Flask sin modificarla.
+        return self.wsgi_app(environ, start_response)
 
 
 # =================================================================================================================
-#         ▀▄▀▄▀▄⡷⠂ BLOQUE 16: RATE LIMITING ⠐⢾▀▄▀▄▀▄
+#              ▀▄▀▄▀▄⡷⠂ BLOQUE 16: RATE LIMITING ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 INTEGRACIÓN EN FACTORY (app/__init__.py)
 # ─────────────────────────────────────────────────────────────────────────────
-# Protección contra ataques de Fuerza Bruta y DDoS.
-# Si un bot intenta hacer 10,000 logins por segundo, tumbará la BD.
-# Flask-Limiter bloquea peticiones a nivel de memoria (o Redis) antes de que
-# toquen tu código de negocio.
+# Rate Limiting es una protección esencial contra abusos en la API:
+#   - Fuerza Bruta: un bot intenta miles de combinaciones de contraseña por segundo.
+#   - DDoS: un atacante satura el servidor con peticiones masivas.
+#   - Scraping: un competidor extrae datos de tu API de forma abusiva.
+#
+# Sin Rate Limiting, un solo atacante puede tumbar tu BD con 10,000 consultas
+# por segundo. Flask-Limiter bloquea las peticiones excesivas a nivel de
+# memoria (o Redis) ANTES de que toquen tu código de negocio.
 #
 # Instalación: pip install Flask-Limiter
+#
+# 💡 Integración con el Factory Pattern (Bloque 9):
+#   def create_app() -> Flask:
+#       app = Flask(__name__)
+#       ...
+#       limiter.init_app(app)  # ← Vincular a la app
+#       return app
 
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-# Inicializamos el limiter usando la IP del cliente como identificador
-# En producción se recomienda usar Redis: storage_uri="redis://localhost:6379"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURACIÓN DEL LIMITER
+# ─────────────────────────────────────────────────────────────────────────────
+
 limiter = Limiter(
     key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"], # Límites globales
-    storage_uri="memory://" 
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://"
 )
-
-# 💡 Uso en controladores (routes.py):
+# key_func=get_remote_address: identifica al cliente por su dirección IP.
+# Cada IP tiene su propio contador independiente de peticiones.
 #
-# @app.route("/login")
-# @limiter.limit("5 per minute")  # Límite estricto para rutas sensibles
+# ⚠️ PRECAUCIÓN DETRÁS DE PROXIES:
+# Si la app está detrás de un proxy reverso (Nginx, AWS ALB, CloudFlare),
+# get_remote_address retorna la IP del PROXY, no la del cliente real.
+# Esto haría que TODOS los clientes compartan el mismo límite.
+# Solución: usar el header X-Forwarded-For con precaución:
+#   key_func=lambda: request.headers.get("X-Forwarded-For", request.remote_addr)
+# ⚠️ X-Forwarded-For puede ser falsificado. En producción, configurar
+# el proxy para sobrescribir este header de forma confiable.
+#
+# default_limits: límites que aplican a TODAS las rutas por defecto.
+# Se expresan en formato legible: "200 per day", "50 per hour", "5 per minute".
+#
+# storage_uri="memory://": almacena los contadores en memoria del proceso.
+# ⚠️ LIMITACIÓN: si usas múltiples workers de Gunicorn, cada worker tiene
+# su propia memoria. Un cliente podría hacer 200 peticiones × 4 workers = 800.
+# En producción con múltiples workers, usar Redis:
+#   storage_uri="redis://localhost:6379/2"
+# Redis comparte el estado entre todos los workers y persiste entre reinicios.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 USO EN CONTROLADORES (routes.py, Bloque 8)
+# ─────────────────────────────────────────────────────────────────────────────
+# Rutas sensibles deben tener límites más estrictos que los globales:
+#
+# @usuarios_bp.route("/login", methods=["POST"])
+# @limiter.limit("5 per minute")
 # def login():
+#     """Login con protección anti-fuerza bruta: máximo 5 intentos por minuto."""
 #     ...
+#
+# @usuarios_bp.route("/registro", methods=["POST"])
+# @limiter.limit("3 per hour")
+# def registro():
+#     """Registro con protección anti-spam: máximo 3 cuentas por hora por IP."""
+#     ...
+#
+# @limiter.exempt
+# @usuarios_bp.route("/health")
+# def health_check():
+#     """Los health checks de infraestructura NO deben tener límite."""
+#     return {"status": "ok"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 REFERENCIA: HEADERS DE RATE LIMITING EN LA RESPUESTA
+# ─────────────────────────────────────────────────────────────────────────────
+# Flask-Limiter inyecta automáticamente headers informativos en cada respuesta:
+#
+# | Header                  | Descripción                                       |
+# | :---                    | :---                                              |
+# | X-RateLimit-Limit       | Límite máximo configurado para esta ruta          |
+# | X-RateLimit-Remaining   | Peticiones restantes en la ventana actual          |
+# | X-RateLimit-Reset       | Timestamp Unix cuando el contador se reinicia      |
+# | Retry-After             | Segundos que el cliente debe esperar (solo en 429) |
+#
+# Cuando se excede el límite, Flask-Limiter retorna automáticamente HTTP 429
+# (Too Many Requests) con el header Retry-After indicando cuándo puede reintentar.
 
 
 # =================================================================================================================
-#         ▀▄▀▄▀▄⡷⠂ BLOQUE 17: TAREAS EN SEGUNDO PLANO (CELERY) ⠐⢾▀▄▀▄▀▄
+#              ▀▄▀▄▀▄⡷⠂ BLOQUE 17: TAREAS EN SEGUNDO PLANO (CELERY) ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 ARCHIVO: app/tasks.py
 # ─────────────────────────────────────────────────────────────────────────────
-# ¿El Problema? Como vimos en el Bloque 9, Gunicorn usa un número limitado de workers (ej: 4).
-# Si `/registro` envía un email que tarda 5 segundos, ese worker queda bloqueado.
-# Si 4 usuarios se registran, los 4 workers se bloquean y tu API entera se CAE temporalmente.
+# ¿El Problema? Como vimos en el Bloque 9, Gunicorn usa un número limitado de
+# workers (ej: 4). Cada worker puede procesar UNA petición a la vez.
+# Si el endpoint /registro envía un email que tarda 5 segundos, ese worker queda
+# bloqueado durante esos 5 segundos sin poder atender otras peticiones.
+# Si 4 usuarios se registran simultáneamente, los 4 workers se bloquean
+# y tu API entera se CAE temporalmente — 100% de capacidad ocupada.
 #
-# ¿La Solución? Celery + Redis.
-# La ruta de Flask solo guarda el usuario en la BD, lanza un mensaje a Redis ("envía el email")
-# y responde en 20ms. Un worker de Celery (proceso independiente) lee Redis y envía el email.
+# ¿La Solución? Celery + Redis (Arquitectura de Colas de Mensajes).
+# En lugar de ejecutar la tarea lenta dentro del request HTTP:
+#   1. La ruta de Flask guarda el usuario en la BD (rápido: ~20ms).
+#   2. Flask publica un MENSAJE en Redis: "envía el email al usuario X".
+#   3. Flask responde al cliente inmediatamente (total: ~50ms).
+#   4. Un WORKER de Celery (proceso independiente, fuera de Flask) lee el
+#      mensaje de Redis y envía el email (tarda 5s, pero no bloquea Flask).
+#
+# Componentes de la Arquitectura:
+#   - Broker (Redis):  Cola de mensajes. Recibe y almacena las tareas pendientes.
+#   - Worker (Celery): Proceso independiente que consume mensajes del Broker.
+#   - Backend (Redis): Almacena los RESULTADOS de las tareas (opcional).
+#                      Útil si necesitas consultar el estado de una tarea.
 #
 # Instalación: pip install celery redis
 
 from celery import Celery
 
-def celery_init_app(app):
-    """Integra Celery con el Application Context de Flask."""
-    # Configuramos Celery usando Redis como Broker (mensajería) y Backend (resultados)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTEGRACIÓN DE CELERY CON FLASK
+# ─────────────────────────────────────────────────────────────────────────────
+
+def celery_init_app(app) -> Celery:
+    """Integra Celery con el Application Context de Flask.
+
+    ¿Por qué es necesaria esta integración?
+    Los workers de Celery son procesos INDEPENDIENTES de Flask. No tienen
+    acceso al contexto de la app (current_app, db, config) por defecto.
+    Si una tarea necesita acceder a la base de datos (ej: marcar un email
+    como enviado), necesita que el app_context esté activo.
+
+    Esta función crea una subclase de Task que envuelve cada ejecución
+    dentro de `with app.app_context():`, haciendo que db, current_app y
+    el resto del contexto de Flask estén disponibles automáticamente.
+
+    Integración en create_app() (Bloque 9):
+      def create_app() -> Flask:
+          app = Flask(__name__)
+          ...
+          celery_app = celery_init_app(app)
+          return app
+    """
     celery_app = Celery(
         app.name,
         broker="redis://localhost:6379/0",
+        # Broker: Redis en el puerto por defecto. La base de datos /0 se usa
+        # para la cola de mensajes. Usar una BD distinta (/1, /2) para no
+        # mezclar con otros usos de Redis (sesiones, caché, blocklist JWT).
         backend="redis://localhost:6379/0"
+        # Backend: donde Celery almacena los RESULTADOS de las tareas.
+        # Si no necesitas consultar resultados, puedes omitir el backend.
     )
     celery_app.conf.update(app.config)
-    
-    # Envolvemos las tareas para que se ejecuten dentro del contexto de Flask
-    # (necesario si la tarea necesita acceder a la base de datos de Flask)
+    # Sincroniza la configuración de Flask con Celery. Permite definir
+    # configuraciones de Celery en config.py (Bloque 3) usando el prefijo CELERY_*.
+
+    # ── ContextTask: Envolver Tareas en el App Context de Flask ──
     class ContextTask(celery_app.Task):
         def __call__(self, *args, **kwargs):
             with app.app_context():
                 return self.run(*args, **kwargs)
+            # with app.app_context(): establece el contexto de Flask para que
+            # dentro de la tarea se pueda acceder a db, current_app, config, etc.
+            # Sin esto, cualquier acceso a la BD lanzaría RuntimeError:
+            # "Working outside of application context."
 
     celery_app.Task = ContextTask
     return celery_app
 
-# 💡 Declaración de una Tarea (tasks.py):
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 DECLARACIÓN DE TAREAS
+# ─────────────────────────────────────────────────────────────────────────────
+# Las tareas se definen con @shared_task (en lugar de @celery_app.task)
+# para desacoplarlas de la instancia concreta de Celery. shared_task permite
+# que la tarea se vincule automáticamente a cualquier instancia de Celery
+# activa, facilitando el testing y la reutilización entre proyectos.
 #
 # from celery import shared_task
 # import time
 #
-# @shared_task
-# def enviar_email_bienvenida(usuario_id: int):
-#     time.sleep(5) # Simula envío lento de red
+# @shared_task(
+#     bind=True,                       # Pasa 'self' como primer argumento (acceso a metadatos)
+#     autoretry_for=(ConnectionError,), # Reintenta automáticamente ante errores de red
+#     max_retries=3,                    # Máximo 3 reintentos antes de fallar definitivamente
+#     retry_backoff=True                # Espera exponencial entre reintentos (2s, 4s, 8s)
+# )
+# def enviar_email_bienvenida(self, usuario_id: int) -> str:
+#     """Envía un email de bienvenida al usuario recién registrado.
+#
+#     Esta tarea se ejecuta en un proceso Celery independiente, no en Flask.
+#     El parámetro 'self' (gracias a bind=True) permite acceder a metadatos:
+#       self.request.id       → ID único de esta ejecución de la tarea
+#       self.request.retries  → Número de reintentos realizados hasta ahora
+#     """
+#     time.sleep(5)  # Simula envío lento de red (SMTP, API externa)
 #     return f"Email enviado al usuario {usuario_id}"
 
-# 💡 Uso en el controlador (routes.py):
-#
-# @app.route("/registro", methods=["POST"])
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 USO EN EL CONTROLADOR (routes.py, Bloque 8)
+# ─────────────────────────────────────────────────────────────────────────────
+# @usuarios_bp.route("/registro", methods=["POST"])
 # def registro():
-#     # ... guardar usuario en BD ...
-#     enviar_email_bienvenida.delay(usuario.id) # .delay() no bloquea!
+#     # ... validar y guardar usuario en BD (rápido: ~50ms) ...
+#     enviar_email_bienvenida.delay(usuario.id)
+#     # .delay() envía la tarea a Redis y retorna INMEDIATAMENTE.
+#     # El worker de Celery la ejecutará en segundo plano.
+#     # .delay(args) es azúcar sintáctico de .apply_async(args=(args,))
 #     return jsonify({"msg": "Registrado. Email en camino."}), 201
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 EJECUCIÓN Y MONITOREO
+# ─────────────────────────────────────────────────────────────────────────────
+# Arrancar el worker de Celery (en una terminal separada):
+#   celery -A app.tasks.celery_app worker --loglevel=info
+#
+# Monitoreo en tiempo real con Flower (dashboard web):
+#   pip install flower
+#   celery -A app.tasks.celery_app flower --port=5555
+#   # Abre http://localhost:5555 para ver tareas activas, completadas y fallidas.
 
 
 # =================================================================================================================
-#         ▀▄▀▄▀▄⡷⠂ BLOQUE 18: DOCKER Y CONTENEDORIZACIÓN ⠐⢾▀▄▀▄▀▄
+#              ▀▄▀▄▀▄⡷⠂ BLOQUE 18: DOCKER Y CONTENEDORIZACIÓN ⠐⢾▀▄▀▄▀▄
 # =================================================================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 ARCHIVO: Dockerfile
 # ─────────────────────────────────────────────────────────────────────────────
 # Un Dockerfile es la receta para crear la "imagen" de tu aplicación.
-# Garantiza que tu app correrá exactamente igual en la nube que en tu laptop.
+# Una imagen es un paquete inmutable que contiene tu código, dependencias,
+# sistema operativo base y configuración — garantiza que tu app correrá
+# exactamente igual en la nube que en tu laptop (reproducibilidad total).
+#
+# 💡 Flujo de Docker:
+#   Dockerfile → (docker build) → Imagen → (docker run) → Contenedor
+#   - Imagen:      Plantilla inmutable (como un .iso de un sistema operativo).
+#   - Contenedor:  Instancia en ejecución de una imagen (como una VM ligera).
+#
+# 💡 ¿Por qué python:3.11-slim? (Elección de Imagen Base)
+#   - python:3.11       → Imagen completa (~900 MB). Incluye compiladores C y herramientas
+#                          de desarrollo. Solo necesaria si compilas extensiones C.
+#   - python:3.11-slim  → Imagen reducida (~150 MB). Incluye Python + mínimas dependencias
+#                          del SO. Balance ideal entre tamaño y compatibilidad.
+#   - python:3.11-alpine → Imagen ultraligera (~50 MB). Usa musl libc en lugar de glibc,
+#                          lo que causa incompatibilidades con paquetes como numpy, pandas,
+#                          y pyodbc. NO RECOMENDADA para aplicaciones con dependencias nativas.
 """
 # Usar imagen base ligera de Python
 FROM python:3.11-slim
 
 # Prevenir que Python escriba archivos .pyc y forzar stdout sin buffer
 ENV PYTHONDONTWRITEBYTECODE=1
+# PYTHONDONTWRITEBYTECODE=1: Python no genera archivos .pyc (bytecode compilado).
+# En un contenedor, los .pyc son innecesarios porque la imagen es inmutable —
+# el bytecode se recompila igual en cada build. Ahorra espacio en disco.
+
 ENV PYTHONUNBUFFERED=1
+# PYTHONUNBUFFERED=1: fuerza a Python a enviar stdout/stderr directamente al
+# terminal sin almacenarlos en un buffer intermedio. Sin esto, los logs de la
+# app podrían retrasarse o perderse si el contenedor se detiene abruptamente.
+# Crítico para que `docker logs` y sistemas de observabilidad reciban logs en tiempo real.
 
 # Directorio de trabajo en el contenedor
 WORKDIR /app
+# WORKDIR establece el directorio base para todos los comandos siguientes.
+# Si /app no existe, Docker lo crea automáticamente.
+# Equivalente a `cd /app` pero persistente para todas las capas posteriores.
 
 # Instalar dependencias del sistema operativo requeridas por pyodbc (SQL Server)
 RUN apt-get update && apt-get install -y curl apt-transport-https unixodbc-dev \\
@@ -2236,59 +3207,118 @@ RUN apt-get update && apt-get install -y curl apt-transport-https unixodbc-dev \
     && apt-get update \\
     && ACCEPT_EULA=Y apt-get install -y msodbcsql17 \\
     && rm -rf /var/lib/apt/lists/*
+# Se encadena todo en un solo RUN para minimizar las capas de la imagen Docker.
+# Cada instrucción RUN crea una capa. Menos capas = imagen más pequeña y rápida.
+# rm -rf /var/lib/apt/lists/* limpia la caché de apt para reducir el tamaño final.
 
 # Instalar dependencias de Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt gunicorn
+# COPY requirements.txt primero (antes del código): Docker cachea cada capa.
+# Si el código cambia pero requirements.txt no, Docker reutiliza la capa de
+# pip install (que es la más lenta, ~30-60s) y solo recopia el código fuente.
+# --no-cache-dir: no almacena la caché de pip (ahorra ~50-100 MB en la imagen).
 
 # Copiar código fuente
 COPY . .
+# Copia TODO el directorio del proyecto al contenedor.
+# ⚠️ Usar un archivo .dockerignore para excluir archivos innecesarios:
+#   .git, __pycache__, .env, node_modules, tests/, *.pyc
 
 # Exponer puerto
 EXPOSE 8000
+# EXPOSE es declarativo: documenta que el contenedor escucha en el puerto 8000.
+# NO abre el puerto. Para exponer el puerto al host, usar:
+#   docker run -p 8000:8000 mi_imagen
 
 # Comando de arranque (Producción)
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "4", "run:app"]
+# CMD define el comando por defecto cuando el contenedor se ejecuta.
+# Se puede sobrescribir en docker run: docker run mi_imagen flask db upgrade
 """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 MEJORA DE SEGURIDAD: USUARIO NO-ROOT
+# ─────────────────────────────────────────────────────────────────────────────
+# Por defecto, los procesos dentro de Docker se ejecutan como root.
+# Si un atacante explota una vulnerabilidad en la app, obtiene permisos root
+# dentro del contenedor (y potencialmente en el host si hay escape de contenedor).
+# Crear un usuario sin privilegios mitiga este riesgo:
+#
+#   RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+#   USER appuser
+#   # A partir de aquí, todos los comandos se ejecutan como 'appuser' (sin root)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📄 ARCHIVO: docker-compose.yml
 # ─────────────────────────────────────────────────────────────────────────────
-# Orquesta la infraestructura de la APLICACIÓN (API + Redis + Celery).
-# ⚠️ NOTA SOBRE LA BASE DE DATOS: 
+# docker-compose orquesta múltiples contenedores como una unidad.
+# Con un solo comando (docker compose up), levanta toda la infraestructura:
+# API + Redis + Celery Worker.
+#
+# ⚠️ NOTA SOBRE LA BASE DE DATOS:
 # En entornos corporativos profesionales, la base de datos SQL Server NO se incluye
 # como un contenedor efímero aquí. Reside en un servidor Windows Server independiente
 # (o un servicio cloud manejado como Azure SQL). Nuestra aplicación en Linux (Docker)
-# se conectará a ese servidor Windows externo.
+# se conecta a ese servidor Windows externo vía red.
 """
 version: '3.8'
 
 services:
-  # 1. Redis (Para Celery y Rate Limiting)
+  # ── 1. Redis (Broker para Celery + Storage para Rate Limiting) ──
   redis:
     image: redis:7-alpine
+    # redis:7-alpine: imagen ultra ligera (~30 MB) de Redis 7.
+    # Alpine Linux es seguro para Redis porque Redis es C puro (no depende de glibc).
     ports:
       - "6379:6379"
+    # Mapea el puerto 6379 del contenedor al puerto 6379 del host.
+    # Formato: "puerto_host:puerto_contenedor"
 
-  # 2. Nuestra API Flask
+  # ── 2. API Flask (Nuestra Aplicación) ──
   api:
     build: .
+    # build: . indica a Docker que construya la imagen usando el Dockerfile
+    # del directorio actual (.).
     ports:
       - "8000:8000"
     environment:
       - FLASK_CONFIG=app.core.config.ProductionConfig
       - SECRET_KEY=clave_secreta_en_produccion
-      # 💡 Nos conectamos al servidor SQL Server externo (ej: IP 192.168.1.100)
-      - SQLALCHEMY_DATABASE_URI=mssql+pyodbc://sa:SuperSecretPass!123@192.168.1.100:1433/mi_basedatos?driver=ODBC+Driver+17+for+SQL+Server
+      # ⚠️ En producción real, NUNCA hardcodear secretos en docker-compose.
+      # Usar Docker secrets o un gestor de secretos externo:
+      #   SECRET_KEY_FILE=/run/secrets/flask_secret
+      - DB_SERVER=192.168.1.100
+      - DB_NAME=mi_basedatos
+      # Nos conectamos al servidor SQL Server EXTERNO (fuera de Docker).
     depends_on:
       - redis
+    # depends_on: garantiza que Redis se levante ANTES que la API.
+    # ⚠️ Solo garantiza el ORDEN de arranque, no que Redis esté LISTO.
+    # Para esperar a que Redis esté operativo, usar healthchecks o wait-for-it.
 
-  # 3. Celery Worker (El mismo código de la API, pero ejecuta otro proceso)
+  # ── 3. Celery Worker (Mismo código, otro proceso) ──
   celery_worker:
     build: .
     command: celery -A app.tasks.celery_app worker --loglevel=info
+    # command: sobrescribe el CMD del Dockerfile. En lugar de levantar Gunicorn,
+    # este contenedor ejecuta un worker de Celery que consume tareas de Redis.
+    # Usa la MISMA imagen Docker que la API (build: .) — mismo código,
+    # diferente punto de entrada.
     environment:
-      - SQLALCHEMY_DATABASE_URI=mssql+pyodbc://sa:SuperSecretPass!123@192.168.1.100:1433/mi_basedatos?driver=ODBC+Driver+17+for+SQL+Server
+      - DB_SERVER=192.168.1.100
+      - DB_NAME=mi_basedatos
     depends_on:
       - redis
 """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📘 COMANDOS ESENCIALES DE DOCKER
+# ─────────────────────────────────────────────────────────────────────────────
+# docker build -t mi_app .                → Construir la imagen desde el Dockerfile
+# docker run -p 8000:8000 mi_app          → Ejecutar un contenedor desde la imagen
+# docker compose up -d                    → Levantar toda la infraestructura (background)
+# docker compose down                     → Detener y eliminar todos los contenedores
+# docker compose logs -f api              → Ver logs en tiempo real del servicio 'api'
+# docker compose exec api flask db upgrade → Ejecutar migraciones dentro del contenedor
+# docker system prune -a                  → Limpiar imágenes y contenedores no utilizados
